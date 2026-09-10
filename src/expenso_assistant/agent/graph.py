@@ -2,12 +2,13 @@
 
 Binds the `tools.py` functions **directly** as LangChain tools (ADR 0008): no
 MCP protocol, no `langchain[mcp]`, no MCP client anywhere in this package. The
-graph is hand-rolled rather than `create_react_agent` so P6-S7 can slot a
-proposal node in front of the write tools and P7-S2 can bind the read-only set,
-and so the per-turn tool-call cap can live in graph state.
+graph is hand-rolled rather than `create_react_agent` so the per-turn tool-call
+cap can live in graph state and a `propose` node can sit in front of the writes.
 
-P6-S5 ships the read-only graph. `tools=` defaults to `READ_TOOLS`; a caller
-never gets a write tool here yet.
+`tools=` defaults to **all** tools (the interactive turn). A message with any
+write call routes to `propose` (P6-S7) — the write functions never run inline;
+read-only calls still go to `tools`. Proactive runs pass `tools=READ_TOOLS`, so
+`route()` can never reach `propose` there.
 """
 
 from __future__ import annotations
@@ -27,6 +28,7 @@ from langgraph.prebuilt import ToolNode
 from .. import tools as tool_defs
 from ..config import get_settings
 from .prompt import render_system_prompt
+from .propose import propose_node
 
 
 class ToolCapExceeded(RuntimeError):
@@ -75,17 +77,23 @@ def build_graph(
         return result
 
     def route(state: AgentState) -> str:
-        last = state["messages"][-1]
-        return "tools" if getattr(last, "tool_calls", None) else END
+        calls = getattr(state["messages"][-1], "tool_calls", None)
+        if not calls:
+            return END
+        if any(c["name"] in tool_defs.WRITE_TOOL_NAMES for c in calls):
+            return "propose"
+        return "tools"
 
     graph = StateGraph(AgentState)
     graph.add_node("agent", agent_node)
     graph.add_node("tools", tools_node)
+    graph.add_node("propose", propose_node)
     graph.add_edge(START, "agent")
-    graph.add_conditional_edges("agent", route, {"tools": "tools", END: END})
+    graph.add_conditional_edges("agent", route, {"tools": "tools", "propose": "propose", END: END})
     graph.add_edge("tools", "agent")
+    graph.add_edge("propose", "agent")
     return graph.compile(checkpointer=checkpointer)
 
 
 def _resolve_tools(tools: Sequence[Callable[..., Any]] | None) -> list[Callable[..., Any]]:
-    return list(tools if tools is not None else tool_defs.READ_TOOLS)
+    return list(tools if tools is not None else tool_defs.ALL_TOOLS)

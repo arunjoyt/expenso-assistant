@@ -23,6 +23,7 @@ from zoneinfo import ZoneInfo
 
 from langchain_core.messages import AIMessage, HumanMessage, RemoveMessage
 from langgraph.errors import GraphRecursionError
+from langgraph.types import Command
 
 from .. import tools as tool_defs
 from ..auth import AuthedMember
@@ -68,6 +69,12 @@ async def stream_turn(
         return
 
     config = _run_config(member, settings)
+
+    # A new message while a confirm card is open means the member moved on — the
+    # thread is linear. Drop the unconfirmed proposal and carry on (P6-S7).
+    if await _discard_pending(graph, config):
+        yield sse("step", {"text": "Discarded the unconfirmed changes"})
+
     pre_ids = await _message_ids(graph, config)
     trace = TurnTrace.start(user_id=member.email, session_id=member.thread_id, user_input=text)
     config["callbacks"] = [trace.callback]
@@ -89,15 +96,27 @@ async def stream_turn(
 async def resume_turn(
     *, graph, member: AuthedMember, decision: dict, settings: Settings
 ) -> AsyncIterator[str]:
-    """Endpoint + SSE shell for P6-S5. The read-only graph never interrupts, so
-    there is nothing to resume yet — the proposal node and the real decision
-    payload land in P6-S7."""
+    """The member's decision on a pending confirm card. Executes the approved
+    subset (P6-S7) and streams the continuation on a fresh SSE leg — its own
+    Langfuse trace, no chat-cap re-check (the turn already passed it)."""
     config = _run_config(member, settings)
-    state = await graph.aget_state(config)
-    if not state.next:
+    if await _pending_card(graph, config) is None:
         yield sse("error", {"code": "nothing_to_resume", "message": "No pending confirmation."})
         return
-    yield sse("error", {"code": "nothing_to_resume", "message": "Resume is not available yet."})
+
+    trace = TurnTrace.start(
+        user_id=member.email, session_id=member.thread_id, user_input=json.dumps(decision)
+    )
+    config["callbacks"] = [trace.callback]
+    client_token = bind_frappe_client(FrappeClient(member.token))
+    entry_token = tool_defs.bind_entry_method("assistant")
+    try:
+        async for event in _drive(graph, Command(resume=decision), config, trace, None, settings):
+            yield event
+    finally:
+        tool_defs.reset_entry_method(entry_token)
+        reset_frappe_client(client_token)
+        _flush_trace()
 
 
 async def history(graph, member: AuthedMember, settings: Settings) -> list[dict]:
@@ -165,6 +184,12 @@ async def _drive(
         yield sse("error", {"code": "internal", "message": "The assistant hit an error."})
         return
 
+    card = await _pending_card(graph, config)
+    if card is not None:
+        trace.finish(output="[needs confirmation]")
+        yield sse("needs_confirmation", card)
+        return
+
     final = "".join(answer)
     trace.finish(output=final)
     yield sse("done", {"message_id": await _latest_ai_id(graph, config)})
@@ -210,8 +235,37 @@ async def _latest_ai_id(graph, config) -> str | None:
     return None
 
 
-async def _rollback(graph, config, pre_ids: set[str]) -> None:
-    """Drop every message this turn added, so history reads as if it never ran."""
+async def _pending_card(graph, config) -> dict | None:
+    """The confirm-card payload if the graph is paused on an `interrupt`."""
+    state = await graph.aget_state(config)
+    for task in state.tasks:
+        for interrupt in task.interrupts:
+            return interrupt.value
+    return None
+
+
+async def _discard_pending(graph, config) -> bool:
+    """Throw away an unconfirmed proposal: drop the AI message whose write
+    tool-calls opened the card, and re-route from `agent` so `state.next` clears.
+    Returns whether there was one."""
+    if await _pending_card(graph, config) is None:
+        return False
+    state = await graph.aget_state(config)
+    messages = (state.values or {}).get("messages", [])
+    for message in reversed(messages):
+        if isinstance(message, AIMessage) and getattr(message, "tool_calls", None):
+            await graph.aupdate_state(
+                config, {"messages": [RemoveMessage(id=message.id)]}, as_node="agent"
+            )
+            return True
+    return False
+
+
+async def _rollback(graph, config, pre_ids: set[str] | None) -> None:
+    """Drop every message this turn added, so history reads as if it never ran.
+    `pre_ids=None` (the resume leg) skips rollback — its writes are real rows."""
+    if pre_ids is None:
+        return
     try:
         state = await graph.aget_state(config)
         stale = [

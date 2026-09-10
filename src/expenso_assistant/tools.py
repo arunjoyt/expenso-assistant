@@ -224,3 +224,26 @@ WRITE_TOOLS = (
     add_source,
     set_budget,
 )
+
+ALL_TOOLS = READ_TOOLS + WRITE_TOOLS
+WRITE_TOOL_NAMES = frozenset(fn.__name__ for fn in WRITE_TOOLS)
+BY_NAME = {fn.__name__: fn for fn in ALL_TOOLS}
+
+# How a proposed write reads on the confirm card, and whether a stale-write
+# guard applies (creates have no prior row).
+_WRITE_KIND = {
+    "create_expense": ("create", "expense"),
+    "update_expense": ("update", "expense"),
+    "delete_expense": ("delete", "expense"),
+    "create_income": ("create", "income"),
+    "update_income": ("update", "income"),
+    "delete_income": ("delete", "income"),
+    "add_category": ("create", "category"),
+    "add_source": ("create", "source"),
+    "set_budget": ("update", "budget"),  # flips to "create" when no row exists yet
+}
+
+
+def write_kind(tool_name: str) -> tuple[str, str]:
+    """(kind, entity) for a write tool — `kind` in create / update / delete."""
+    return _WRITE_KIND[tool_name]

@@ -15,18 +15,20 @@ from .fakes import ScriptedChatModel
 _AGENT_DIR = pathlib.Path(__file__).parent.parent / "src" / "expenso_assistant" / "agent"
 
 
-def test_graph_binds_exactly_the_read_tools():
+def test_interactive_graph_binds_read_and_write_tools_directly():
     model = ScriptedChatModel()
     build_graph(model, checkpointer=InMemorySaver())
 
-    read_names = {fn.__name__ for fn in tools.READ_TOOLS}
-    assert set(model.bound_tools) == read_names
-    assert bound_tool_names() == read_names
+    all_names = {fn.__name__ for fn in tools.ALL_TOOLS}
+    assert set(model.bound_tools) == all_names
+    assert bound_tool_names() == all_names
 
 
-def test_no_write_tool_is_ever_bound_in_the_read_only_graph():
+def test_read_only_graph_binds_no_write_tool():
+    """Proactive runs (P7-S2) pass tools=READ_TOOLS — no write tool is bound, so
+    route() can never reach the propose node there."""
     model = ScriptedChatModel()
-    build_graph(model, checkpointer=InMemorySaver())
+    build_graph(model, checkpointer=InMemorySaver(), tools=tools.READ_TOOLS)
 
     write_names = {fn.__name__ for fn in tools.WRITE_TOOLS}
     assert not set(model.bound_tools) & write_names

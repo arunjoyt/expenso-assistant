@@ -103,10 +103,15 @@ class Settings(BaseSettings):
     run_max_tool_calls: int = 20
     run_wall_clock_seconds: int = 90
 
-    # Per-Member daily caps, counted from Langfuse, fail-open (P6-S5).
+    # Per-Member daily chat cap, counted from Langfuse, fail-open (P6-S5).
     daily_chat_cap: int = 50
-    daily_receipt_cap: int = 30
-    daily_write_cap: int = 100
+
+    # Confirm-card batch cap (P6-S7): the propose node shows at most this many
+    # proposed writes per card and tells the model to continue with the rest.
+    # This replaced the daily write cap — every in-app write is Member-confirmed,
+    # so the useful bound is blast radius per confirmation, not a daily total
+    # (ADR 0008's 2026-09-10 P6-S7 update).
+    max_proposed_writes_per_turn: int = 25
 
     http_timeout_seconds: float = 30.0
 
