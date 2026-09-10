@@ -25,7 +25,7 @@ src/expenso_assistant/
   frappe_client.py  thin async Frappe REST client, bearer passthrough
   tools.py          the ONE tool definition (reads + writes) — both consumers bind here
   auth.py           resource-server auth: Frappe token introspection + OAuth proxy (PKCE)
-  mcp_server.py     FastMCP adapter — registers tools.py, elicitation on writes, MCP_ENABLED-gated
+  mcp_server.py     FastMCP adapter — registers tools.py, SEP-2322 confirm on writes, MCP_ENABLED-gated
   api/main.py       FastAPI: /health, /mcp mount  (SSE run + /resume come in P6-S5)
   agent/            LangGraph agent  (P6-S5)
 ```

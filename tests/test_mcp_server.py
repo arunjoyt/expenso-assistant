@@ -15,7 +15,7 @@ from .conftest import API, method_url
 
 
 async def test_mcp_exposes_every_tool_definition():
-    async with Client(build_mcp_server(), mode="legacy") as client:
+    async with Client(build_mcp_server()) as client:
         names = {tool.name for tool in await client.list_tools()}
 
     assert names == {fn.__name__ for fn in (*tools.READ_TOOLS, *tools.WRITE_TOOLS)}
@@ -35,27 +35,28 @@ def test_mcp_not_mounted_when_disabled(monkeypatch):
 
 
 @respx.mock
-async def test_write_tool_elicits_once_then_writes_with_connector_provenance():
+async def test_write_tool_confirms_then_writes_with_connector_provenance():
     route = respx.post(method_url(f"{API}.create_expense")).mock(
         return_value=httpx.Response(200, json={"message": {"name": "e-new"}})
     )
-    prompts = []
+    asked = []
 
-    async def accept(message, response_type, params, context):
-        prompts.append(message)
-        return True
+    async def approve(message, response_type, params, context):
+        asked.append(message)
+        return {"confirm": True}
 
-    async with Client(build_mcp_server(), elicitation_handler=accept, mode="legacy") as client:
+    async with Client(build_mcp_server(), elicitation_handler=approve) as client:
         result = await client.call_tool("create_expense", {"amount": 9, "notes": "Coffee"})
 
-    assert len(prompts) == 1
+    assert len(asked) == 1  # asked exactly once, before the write
+    assert "create_expense" in asked[0]
     assert route.called
     assert json.loads(route.calls.last.request.read())["entry_method"] == "connector"
     assert result.data["name"] == "e-new"
 
 
 @respx.mock
-async def test_write_tool_does_not_write_on_decline():
+async def test_write_tool_does_not_write_when_confirmation_declined():
     route = respx.post(method_url(f"{API}.create_expense")).mock(
         return_value=httpx.Response(200, json={"message": {"name": "nope"}})
     )
@@ -63,30 +64,46 @@ async def test_write_tool_does_not_write_on_decline():
     async def decline(message, response_type, params, context):
         return ElicitResult(action="decline")
 
-    async with Client(build_mcp_server(), elicitation_handler=decline, mode="legacy") as client:
+    async with Client(build_mcp_server(), elicitation_handler=decline) as client:
         result = await client.call_tool("create_expense", {"amount": 9})
 
     assert not route.called
     assert result.data["status"] == "cancelled"
 
 
+@respx.mock
+async def test_write_tool_does_not_write_when_confirmation_is_false():
+    route = respx.post(method_url(f"{API}.create_income")).mock(
+        return_value=httpx.Response(200, json={"message": {"name": "nope"}})
+    )
+
+    async def say_no(message, response_type, params, context):
+        return {"confirm": False}
+
+    async with Client(build_mcp_server(), elicitation_handler=say_no) as client:
+        result = await client.call_tool("create_income", {"amount": 9})
+
+    assert not route.called
+    assert result.data["status"] == "cancelled"
+
+
+@respx.mock
 async def test_read_tool_needs_no_confirmation():
-    with respx.mock:
-        route = respx.get(method_url(f"{API}.list_categories")).mock(
-            return_value=httpx.Response(200, json={"message": ["Groceries"]})
-        )
+    route = respx.get(method_url(f"{API}.list_categories")).mock(
+        return_value=httpx.Response(200, json={"message": ["Groceries"]})
+    )
 
-        async def refuse(message, response_type, params, context):  # would fail the call
-            return ElicitResult(action="decline")
+    async def refuse(message, response_type, params, context):
+        return ElicitResult(action="decline")
 
-        async with Client(build_mcp_server(), elicitation_handler=refuse, mode="legacy") as client:
-            result = await client.call_tool("list_categories", {})
+    async with Client(build_mcp_server(), elicitation_handler=refuse) as client:
+        result = await client.call_tool("list_categories", {})
 
     assert route.called
     assert result.data == ["Groceries"]
 
 
-async def test_write_rejected_before_elicitation_without_write_scope(monkeypatch):
+async def test_write_rejected_before_confirmation_without_write_scope(monkeypatch):
     monkeypatch.setattr(
         mcp_server, "get_settings", lambda: types.SimpleNamespace(frappe_oauth_client_id="x")
     )
