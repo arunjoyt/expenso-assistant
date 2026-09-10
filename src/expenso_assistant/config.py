@@ -74,6 +74,15 @@ class Settings(BaseSettings):
     # effect on the in-app Assistant (P6-S5+).
     mcp_enabled: bool = True
 
+    # Origins allowed to call the service from a browser (the in-app Assistant
+    # tab, P6-S6). Comma-separated; the Frappe app's public origin(s). Empty in
+    # dev where the frontend is same-origin-proxied or not browser-driven.
+    allowed_cors_origins: str = ""
+
+    @property
+    def cors_origins(self) -> list[str]:
+        return [origin.strip() for origin in self.allowed_cors_origins.split(",") if origin.strip()]
+
     # Observability (P6-S5) — self-hosted Langfuse v2, loopback only in prod.
     langfuse_public_key: str = ""
     langfuse_secret_key: str = ""

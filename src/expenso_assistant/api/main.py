@@ -16,6 +16,7 @@ from __future__ import annotations
 from contextlib import AsyncExitStack, asynccontextmanager
 
 from fastapi import FastAPI, Request
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
@@ -66,6 +67,16 @@ def create_app(*, graph=None, checkpointer=None) -> FastAPI:
     app = FastAPI(title="expenso-assistant", version=__version__, lifespan=lifespan)
     if injected:  # tests skip the lifespan; wire state up front
         app.state.graph, app.state.checkpointer = graph, checkpointer
+
+    # The in-app Assistant tab calls /chat from the Frappe origin (P6-S6). The
+    # bearer rides an Authorization header, so that header must be allowed.
+    if settings.cors_origins:
+        app.add_middleware(
+            CORSMiddleware,
+            allow_origins=settings.cors_origins,
+            allow_methods=["GET", "POST", "DELETE", "OPTIONS"],
+            allow_headers=["Authorization", "Content-Type"],
+        )
 
     @app.get("/health")
     async def health() -> dict:
