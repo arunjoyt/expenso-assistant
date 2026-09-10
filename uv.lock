@@ -490,26 +490,24 @@ wheels = [
 
 [[package]]
 name = "expenso-assistant"
-version = "0.1.0"
+version = "0.2.0"
 source = { editable = "." }
 dependencies = [
     { name = "fastapi" },
     { name = "fastmcp" },
     { name = "httpx" },
-    { name = "pydantic" },
-    { name = "pydantic-settings" },
-    { name = "uvicorn", extra = ["standard"] },
-]
-
-[package.optional-dependencies]
-agent = [
     { name = "langchain-core" },
     { name = "langchain-openai" },
     { name = "langfuse" },
     { name = "langgraph" },
     { name = "langgraph-checkpoint-postgres" },
     { name = "psycopg", extra = ["binary"] },
+    { name = "pydantic" },
+    { name = "pydantic-settings" },
+    { name = "uvicorn", extra = ["standard"] },
 ]
+
+[package.optional-dependencies]
 dev = [
     { name = "pytest" },
     { name = "pytest-asyncio" },
@@ -522,12 +520,12 @@ requires-dist = [
     { name = "fastapi", specifier = ">=0.115" },
     { name = "fastmcp", specifier = ">=4.0" },
     { name = "httpx", specifier = ">=0.27" },
-    { name = "langchain-core", marker = "extra == 'agent'", specifier = ">=0.3" },
-    { name = "langchain-openai", marker = "extra == 'agent'", specifier = ">=0.2" },
-    { name = "langfuse", marker = "extra == 'agent'", specifier = ">=2.50,<3" },
-    { name = "langgraph", marker = "extra == 'agent'", specifier = ">=0.2" },
-    { name = "langgraph-checkpoint-postgres", marker = "extra == 'agent'", specifier = ">=2.0" },
-    { name = "psycopg", extras = ["binary"], marker = "extra == 'agent'", specifier = ">=3.2" },
+    { name = "langchain-core", specifier = ">=0.3" },
+    { name = "langchain-openai", specifier = ">=0.2" },
+    { name = "langfuse", specifier = ">=2.50,<3" },
+    { name = "langgraph", specifier = ">=0.2" },
+    { name = "langgraph-checkpoint-postgres", specifier = ">=2.0" },
+    { name = "psycopg", extras = ["binary"], specifier = ">=3.2" },
     { name = "pydantic", specifier = ">=2.7" },
     { name = "pydantic-settings", specifier = ">=2.3" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=8.2" },
@@ -536,7 +534,7 @@ requires-dist = [
     { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.6" },
     { name = "uvicorn", extras = ["standard"], specifier = ">=0.30" },
 ]
-provides-extras = ["agent", "dev"]
+provides-extras = ["dev"]
 
 [[package]]
 name = "fastapi"

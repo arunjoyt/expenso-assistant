@@ -1,0 +1,225 @@
+"""One chat turn: drive the graph, translate its events to SSE, and keep the
+thread clean if the turn fails.
+
+SSE event vocabulary (P6-S5 grill, Q4):
+
+- `step`  `{text}`        — a humanized tool call, one line per action
+- `token` `{text}`        — a delta of the streamed answer
+- `done`  `{message_id}`  — the turn completed; commit the streamed answer
+- `error` `{code, message}` — cap hit / failure; the client discards any partial
+
+`needs_confirmation` is added in P6-S7. On any `error` the turn is rolled back to
+the pre-run message set, so a failed turn leaves nothing behind in history.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+from collections.abc import AsyncIterator
+from datetime import datetime
+from zoneinfo import ZoneInfo
+
+from langchain_core.messages import AIMessage, HumanMessage, RemoveMessage
+from langgraph.errors import GraphRecursionError
+
+from .. import tools as tool_defs
+from ..auth import AuthedMember
+from ..config import Settings
+from ..frappe_client import FrappeClient, bind_frappe_client, reset_frappe_client
+from .graph import ToolCapExceeded
+from .observability import TurnTrace, within_daily_chat_cap
+
+logger = logging.getLogger(__name__)
+
+_HUMANIZE = {
+    "get_expenses": "Reading expenses",
+    "get_income": "Reading income",
+    "get_analytics": "Checking the monthly summary",
+    "get_budgets": "Reading budgets",
+    "list_categories": "Listing categories",
+    "list_sources": "Listing income sources",
+}
+
+_MONTHS = (
+    "January February March April May June July August September October November December".split()
+)
+
+
+def sse(event: str, data: dict) -> str:
+    return f"event: {event}\ndata: {json.dumps(data)}\n\n"
+
+
+def humanize(tool_name: str, args: dict | None) -> str:
+    base = _HUMANIZE.get(tool_name, tool_name.replace("_", " ").capitalize())
+    month, year = (args or {}).get("month"), (args or {}).get("year")
+    if isinstance(month, int) and 1 <= month <= 12:
+        span = _MONTHS[month - 1] + (f" {year}" if year else "")
+        return f"{base} for {span}"
+    return f"{base}…"
+
+
+async def stream_turn(
+    *, graph, member: AuthedMember, text: str, settings: Settings
+) -> AsyncIterator[str]:
+    if not within_daily_chat_cap(member.email):
+        yield sse("error", {"code": "daily_cap", "message": "You've reached today's chat limit."})
+        return
+
+    config = _run_config(member, settings)
+    pre_ids = await _message_ids(graph, config)
+    trace = TurnTrace.start(user_id=member.email, session_id=member.thread_id, user_input=text)
+    config["callbacks"] = [trace.callback]
+
+    # The graph's tool node reaches Frappe as this Member (bearer passthrough),
+    # same contextvar the FastMCP adapter binds.
+    client_token = bind_frappe_client(FrappeClient(member.token))
+    entry_token = tool_defs.bind_entry_method("assistant")
+    try:
+        inputs = {"messages": [HumanMessage(text)], "tool_call_count": 0}
+        async for event in _drive(graph, inputs, config, trace, pre_ids, settings):
+            yield event
+    finally:
+        tool_defs.reset_entry_method(entry_token)
+        reset_frappe_client(client_token)
+        _flush_trace()  # last, so the trace's final output/cost updates go too
+
+
+async def resume_turn(
+    *, graph, member: AuthedMember, decision: dict, settings: Settings
+) -> AsyncIterator[str]:
+    """Endpoint + SSE shell for P6-S5. The read-only graph never interrupts, so
+    there is nothing to resume yet — the proposal node and the real decision
+    payload land in P6-S7."""
+    config = _run_config(member, settings)
+    state = await graph.aget_state(config)
+    if not state.next:
+        yield sse("error", {"code": "nothing_to_resume", "message": "No pending confirmation."})
+        return
+    yield sse("error", {"code": "nothing_to_resume", "message": "Resume is not available yet."})
+
+
+async def history(graph, member: AuthedMember, settings: Settings) -> list[dict]:
+    state = await graph.aget_state(_run_config(member, settings))
+    messages = (state.values or {}).get("messages", [])
+    out: list[dict] = []
+    for message in messages:
+        if isinstance(message, HumanMessage):
+            out.append({"id": message.id, "role": "user", "content": message.content})
+        elif isinstance(message, AIMessage) and message.content and not message.tool_calls:
+            out.append({"id": message.id, "role": "assistant", "content": message.content})
+    return out
+
+
+async def clear_thread(checkpointer, member: AuthedMember) -> None:
+    await checkpointer.adelete_thread(member.thread_id)
+
+
+# --- internals ------------------------------------------------------------
+
+
+def _run_config(member: AuthedMember, settings: Settings) -> dict:
+    # `today` as an ISO string, not a date — it rides in `configurable`, which
+    # the Postgres checkpointer serializes as JSON.
+    today = datetime.now(ZoneInfo(settings.service_timezone)).date().isoformat()
+    return {
+        "configurable": {"thread_id": member.thread_id, "today": today},
+        "recursion_limit": settings.run_recursion_limit,
+    }
+
+
+async def _drive(
+    graph, inputs, config, trace: TurnTrace, pre_ids, settings: Settings
+) -> AsyncIterator[str]:
+    answer: list[str] = []
+    deadline = asyncio.get_event_loop().time() + settings.run_wall_clock_seconds
+    events = graph.astream_events(inputs, config, version="v2")
+    try:
+        while True:
+            remaining = deadline - asyncio.get_event_loop().time()
+            if remaining <= 0:
+                raise TimeoutError
+            try:
+                event = await asyncio.wait_for(events.__anext__(), timeout=remaining)
+            except StopAsyncIteration:
+                break
+            kind = event["event"]
+            if kind == "on_tool_start":
+                yield sse("step", {"text": humanize(event["name"], event["data"].get("input"))})
+            elif kind == "on_chat_model_stream":
+                piece = _chunk_text(event["data"].get("chunk"))
+                if piece:
+                    answer.append(piece)
+                    yield sse("token", {"text": piece})
+    except (TimeoutError, GraphRecursionError, ToolCapExceeded) as exc:
+        code = _ERROR_CODES[type(exc)]
+        await _rollback(graph, config, pre_ids)
+        trace.fail(code)
+        yield sse("error", {"code": code, "message": _ERROR_MESSAGES[code]})
+        return
+    except Exception:
+        logger.exception("chat turn failed")
+        await _rollback(graph, config, pre_ids)
+        trace.fail("internal")
+        yield sse("error", {"code": "internal", "message": "The assistant hit an error."})
+        return
+
+    final = "".join(answer)
+    trace.finish(output=final)
+    yield sse("done", {"message_id": await _latest_ai_id(graph, config)})
+
+
+_ERROR_CODES = {
+    TimeoutError: "wall_clock",
+    GraphRecursionError: "recursion",
+    ToolCapExceeded: "tool_cap",
+}
+
+_ERROR_MESSAGES = {
+    "wall_clock": "The assistant took too long and stopped.",
+    "recursion": "The assistant got stuck and stopped.",
+    "tool_cap": "The assistant tried too many steps and stopped.",
+}
+
+
+def _flush_trace() -> None:
+    from .observability import langfuse_client
+
+    try:
+        langfuse_client().flush()
+    except Exception as exc:
+        logger.warning("langfuse flush failed: %s", exc)
+
+
+def _chunk_text(chunk) -> str:
+    content = getattr(chunk, "content", "")
+    return content if isinstance(content, str) else ""
+
+
+async def _message_ids(graph, config) -> set[str]:
+    state = await graph.aget_state(config)
+    return {m.id for m in (state.values or {}).get("messages", [])}
+
+
+async def _latest_ai_id(graph, config) -> str | None:
+    state = await graph.aget_state(config)
+    for message in reversed((state.values or {}).get("messages", [])):
+        if isinstance(message, AIMessage) and message.content:
+            return message.id
+    return None
+
+
+async def _rollback(graph, config, pre_ids: set[str]) -> None:
+    """Drop every message this turn added, so history reads as if it never ran."""
+    try:
+        state = await graph.aget_state(config)
+        stale = [
+            RemoveMessage(id=m.id)
+            for m in (state.values or {}).get("messages", [])
+            if m.id not in pre_ids
+        ]
+        if stale:
+            await graph.aupdate_state(config, {"messages": stale})
+    except Exception as exc:
+        logger.warning("turn rollback failed: %s", exc)

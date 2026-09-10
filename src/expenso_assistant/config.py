@@ -82,8 +82,15 @@ class Settings(BaseSettings):
     # LangGraph checkpointer + Langfuse share this Postgres (P6-S5).
     database_url: str = "postgresql://postgres:postgres@localhost:5432/assistant"
 
-    # Per-run runaway guard (P6-S5).
-    run_recursion_limit: int = 25
+    # "Today" for the daily caps and the agent's date reasoning. The Family's
+    # timezone context; one Family in v1.
+    service_timezone: str = "Asia/Kolkata"
+
+    # Per-run runaway guard (P6-S5). One agent->tools cycle is two graph
+    # super-steps, so the recursion limit sits above 2 x run_max_tool_calls to
+    # keep the tool-call cap the one that bites first; recursion is the backstop
+    # for a pathological loop that never calls a tool.
+    run_recursion_limit: int = 50
     run_max_tool_calls: int = 20
     run_wall_clock_seconds: int = 90
 

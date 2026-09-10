@@ -11,10 +11,40 @@ API = "expenso.expenso.api"
 def _settings(monkeypatch):
     monkeypatch.setenv("FRAPPE_URL", FRAPPE_URL)
     monkeypatch.setenv("MCP_ENABLED", "true")
+    monkeypatch.setenv("SERVICE_TIMEZONE", "UTC")
+    monkeypatch.setenv("RUN_WALL_CLOCK_SECONDS", "30")
     monkeypatch.delenv("FRAPPE_OAUTH_CLIENT_ID", raising=False)
     get_settings.cache_clear()
     yield
     get_settings.cache_clear()
+
+
+@pytest.fixture
+def spy_langfuse(monkeypatch):
+    """Replace the Langfuse client with a recording spy. Returns a factory so a
+    test can set the trace count / a fetch error before the first use."""
+    from expenso_assistant.agent import observability
+
+    from .fakes import SpyLangfuse
+
+    def install(**kwargs) -> SpyLangfuse:
+        spy = SpyLangfuse(**kwargs)
+        monkeypatch.setattr(observability, "_client", spy)
+        return spy
+
+    observability.reset_langfuse_client()
+    yield install
+    observability.reset_langfuse_client()
+
+
+@pytest.fixture
+def member():
+    from expenso_assistant.auth import AuthedMember, thread_id_for
+
+    email = "priya@example.com"
+    return AuthedMember(
+        email=email, thread_id=thread_id_for(email), scopes=("expenso:read",), token="member-bearer"
+    )
 
 
 @pytest.fixture(autouse=True)
