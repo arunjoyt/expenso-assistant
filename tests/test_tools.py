@@ -47,16 +47,33 @@ async def test_create_expense_posts_entry_method_from_context():
     finally:
         tools.reset_entry_method(token)
 
-    body = respx.calls.last.request.read()
     import json
 
-    payload = json.loads(body)
+    payload = json.loads(respx.calls.last.request.read())
     assert payload["entry_method"] == "connector"
     assert payload["amount"] == 12.5
     assert payload["notes"] == "Lunch"
     # None-valued optionals are dropped, not sent as null.
-    assert "date" not in payload and "category" not in payload
+    assert "date" not in payload and "category" not in payload and "external_message" not in payload
     assert route.called
+
+
+@respx.mock
+async def test_create_expense_forwards_message_as_external_message():
+    respx.post(method_url(f"{API}.create_expense")).mock(
+        return_value=httpx.Response(200, json={"message": {"name": "e1"}})
+    )
+
+    token = tools.bind_entry_method("connector")
+    try:
+        await tools.create_expense(amount=1, message="spent 1 on parking")
+    finally:
+        tools.reset_entry_method(token)
+
+    import json
+
+    payload = json.loads(respx.calls.last.request.read())
+    assert payload["external_message"] == "spent 1 on parking"
 
 
 @respx.mock

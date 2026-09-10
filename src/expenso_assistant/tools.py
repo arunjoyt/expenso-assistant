@@ -83,8 +83,12 @@ async def create_expense(
     date: str | None = None,
     category: str | None = None,
     notes: str | None = None,
+    message: str | None = None,
 ) -> dict:
-    """Create an Expense. `category` must match an existing Category name."""
+    """Create an Expense. `category` is matched to an existing Category by name
+    or label; an unmatched value is left unset. `message` is stored for audit
+    only on external-connector writes (never shown in the app) — omit it for
+    in-app Assistant writes, which the Member has already confirmed."""
     return await current_frappe_client().call(
         f"{_API}.create_expense",
         write=True,
@@ -93,6 +97,7 @@ async def create_expense(
         category=category,
         notes=notes,
         entry_method=_entry_method.get(),
+        external_message=message,
     )
 
 
@@ -130,8 +135,11 @@ async def create_income(
     date: str | None = None,
     source: str | None = None,
     notes: str | None = None,
+    message: str | None = None,
 ) -> dict:
-    """Create an Income. `source` must match an existing Source name."""
+    """Create an Income. `source` is matched to an existing Source by name or
+    label; an unmatched value is left unset. `message` is audit-only on
+    external-connector writes (see `create_expense`)."""
     return await current_frappe_client().call(
         f"{_API}.create_income",
         write=True,
@@ -140,6 +148,7 @@ async def create_income(
         source=source,
         notes=notes,
         entry_method=_entry_method.get(),
+        external_message=message,
     )
 
 
