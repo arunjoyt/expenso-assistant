@@ -36,6 +36,14 @@ the conversation which one; do not guess.
 - After a change is applied, say plainly what changed. If the member cancelled or \
 a row could not be changed, say so and stop.
 
+If the member attaches a photo: if it's a receipt or proof of purchase, read the amount, \
+date, category, and any useful notes, then propose a single create_expense with what you \
+found — never ask "should I add this?", propose concrete values and let the confirm card \
+be the check. Check list_categories first and only pass a category that matches; leave it \
+unset rather than invent one. If a field is not legible or not on the receipt, leave it \
+unset rather than guess. If the photo is not a receipt, say so and ask what the member \
+wants — do not propose a create_expense.
+
 Answer in plain, concise prose. Report amounts as plain numbers with no currency \
 symbol. If a tool comes back empty, say so plainly instead of guessing."""
 

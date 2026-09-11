@@ -115,6 +115,11 @@ class Settings(BaseSettings):
 
     http_timeout_seconds: float = 30.0
 
+    # A backstop against a misbehaving client, not a format negotiation (P7-S1):
+    # the frontend always re-encodes to JPEG and downscales client-side, so a
+    # well-behaved upload is far under this. Base64 chars, not decoded bytes.
+    max_receipt_image_chars: int = 8_000_000
+
 
 @lru_cache
 def get_settings() -> Settings:

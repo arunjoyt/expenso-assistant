@@ -15,7 +15,7 @@ from __future__ import annotations
 
 from contextlib import AsyncExitStack, asynccontextmanager
 
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
@@ -33,6 +33,10 @@ _SSE = "text/event-stream"
 
 class ChatIn(BaseModel):
     message: str
+    # A `data:image/jpeg;base64,...` data URI (P7-S1) — the frontend always
+    # re-encodes to JPEG client-side, so this is the one shape the service
+    # needs to accept. Never persisted; see agent/session.py.
+    image: str | None = None
 
 
 class ResumeIn(BaseModel):
@@ -84,8 +88,14 @@ def create_app(*, graph=None, checkpointer=None) -> FastAPI:
 
     @app.post("/chat")
     async def chat(body: ChatIn, request: Request, member: AuthedMember = MemberDep):
+        if body.image and len(body.image) > settings.max_receipt_image_chars:
+            raise HTTPException(413, "image is too large")
         stream = session.stream_turn(
-            graph=request.app.state.graph, member=member, text=body.message, settings=settings
+            graph=request.app.state.graph,
+            member=member,
+            text=body.message,
+            settings=settings,
+            image=body.image,
         )
         return StreamingResponse(stream, media_type=_SSE)
 

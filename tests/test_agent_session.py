@@ -54,9 +54,11 @@ async def collect(stream) -> list[tuple[str, dict]]:
     return events
 
 
-async def run_turn(graph, member, text: str) -> list[tuple[str, dict]]:
+async def run_turn(graph, member, text: str, *, image: str | None = None) -> list[tuple[str, dict]]:
     return await collect(
-        session.stream_turn(graph=graph, member=member, text=text, settings=get_settings())
+        session.stream_turn(
+            graph=graph, member=member, text=text, settings=get_settings(), image=image
+        )
     )
 
 

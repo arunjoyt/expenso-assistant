@@ -63,12 +63,14 @@ async def test_daily_cap_query_shape(member, spy):
 
     await run_turn(graph, member, "hello")
 
-    assert len(spy.fetch_calls) == 1
-    call = spy.fetch_calls[0]
-    assert call["user_id"] == member.email
-    assert call["tags"] == ["feature:chat"]
-    assert call["limit"] == get_settings().daily_chat_cap
-    assert "from_timestamp" in call
+    # The chat cap is shared with receipt turns (P7-S1) — one query per feature tag.
+    assert len(spy.fetch_calls) == 2
+    tags = {tuple(call["tags"]) for call in spy.fetch_calls}
+    assert tags == {("feature:chat",), ("feature:receipt",)}
+    for call in spy.fetch_calls:
+        assert call["user_id"] == member.email
+        assert call["limit"] == get_settings().daily_chat_cap
+        assert "from_timestamp" in call
 
 
 async def test_daily_cap_checked_before_this_runs_own_trace_opens(member, spy_langfuse):

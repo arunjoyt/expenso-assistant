@@ -30,7 +30,7 @@ from ..auth import AuthedMember
 from ..config import Settings
 from ..frappe_client import FrappeClient, bind_frappe_client, reset_frappe_client
 from .graph import ToolCapExceeded
-from .observability import TurnTrace, within_daily_chat_cap
+from .observability import FEATURE_CHAT, FEATURE_RECEIPT, TurnTrace, within_daily_chat_cap
 
 logger = logging.getLogger(__name__)
 
@@ -62,29 +62,41 @@ def humanize(tool_name: str, args: dict | None) -> str:
 
 
 async def stream_turn(
-    *, graph, member: AuthedMember, text: str, settings: Settings
+    *, graph, member: AuthedMember, text: str, settings: Settings, image: str | None = None
 ) -> AsyncIterator[str]:
     if not within_daily_chat_cap(member.email):
         yield sse("error", {"code": "daily_cap", "message": "You've reached today's chat limit."})
         return
 
-    config = _run_config(member, settings)
+    config = _run_config(member, settings, image=image)
+    entry_method = "receipt" if image else "assistant"
+    feature = FEATURE_RECEIPT if image else FEATURE_CHAT
 
     # A new message while a confirm card is open means the member moved on — the
     # thread is linear. Drop the unconfirmed proposal and carry on (P6-S7).
     if await _discard_pending(graph, config):
         yield sse("step", {"text": "Discarded the unconfirmed changes"})
 
+    if image:
+        yield sse("step", {"text": "Reading the receipt…"})
+
     pre_ids = await _message_ids(graph, config)
-    trace = TurnTrace.start(user_id=member.email, session_id=member.thread_id, user_input=text)
+    trace = TurnTrace.start(
+        user_id=member.email, session_id=member.thread_id, user_input=text, feature=feature
+    )
     config["callbacks"] = [trace.callback]
 
     # The graph's tool node reaches Frappe as this Member (bearer passthrough),
     # same contextvar the FastMCP adapter binds.
     client_token = bind_frappe_client(FrappeClient(member.token))
-    entry_token = tool_defs.bind_entry_method("assistant")
+    entry_token = tool_defs.bind_entry_method(entry_method)
     try:
-        inputs = {"messages": [HumanMessage(text)], "tool_call_count": 0}
+        human_text = _human_text(text, image)
+        inputs = {
+            "messages": [HumanMessage(human_text)],
+            "tool_call_count": 0,
+            "entry_method": entry_method,
+        }
         async for event in _drive(graph, inputs, config, trace, pre_ids, settings):
             yield event
     finally:
@@ -108,6 +120,9 @@ async def resume_turn(
         user_id=member.email, session_id=member.thread_id, user_input=json.dumps(decision)
     )
     config["callbacks"] = [trace.callback]
+    # propose.py's _apply reads this to post receipt_accuracy_* scores here —
+    # the comparison only exists once the Member confirms/edits (P7-S1).
+    config["configurable"]["trace"] = trace
     client_token = bind_frappe_client(FrappeClient(member.token))
     entry_token = tool_defs.bind_entry_method("assistant")
     try:
@@ -138,14 +153,25 @@ async def clear_thread(checkpointer, member: AuthedMember) -> None:
 # --- internals ------------------------------------------------------------
 
 
-def _run_config(member: AuthedMember, settings: Settings) -> dict:
+def _run_config(member: AuthedMember, settings: Settings, *, image: str | None = None) -> dict:
     # `today` as an ISO string, not a date — it rides in `configurable`, which
-    # the Postgres checkpointer serializes as JSON.
+    # the Postgres checkpointer serializes as JSON. `receipt_image` rides here
+    # too (P7-S1) rather than in graph state, precisely so it is never
+    # checkpointed — `config` is per-run, `state` is what Postgres persists.
     today = datetime.now(ZoneInfo(settings.service_timezone)).date().isoformat()
-    return {
-        "configurable": {"thread_id": member.thread_id, "today": today},
-        "recursion_limit": settings.run_recursion_limit,
-    }
+    configurable = {"thread_id": member.thread_id, "today": today}
+    if image:
+        configurable["receipt_image"] = image
+    return {"configurable": configurable, "recursion_limit": settings.run_recursion_limit}
+
+
+def _human_text(text: str, image: str | None) -> str:
+    """What gets checkpointed for this turn's HumanMessage — the image itself
+    never does (P7-S1). A short marker, plus any caption the Member typed."""
+    if not image:
+        return text
+    marker = "[Attached a photo]"
+    return f"{marker} {text}" if text else marker
 
 
 async def _drive(

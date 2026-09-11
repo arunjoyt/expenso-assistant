@@ -30,6 +30,11 @@ _TIMESTAMP_MISMATCH = "TimestampMismatchError"
 _READ_FOR_ENTITY = {"expense": "get_expenses", "income": "get_income"}
 _LABEL_FIELD = {"expense": "category", "income": "source"}
 
+# Receipt extraction accuracy (ADR 0003, unchanged metric; P7-S1 relocates the
+# capture point to the resume trace). A proposed `None` is excluded entirely —
+# there was no claim to grade.
+_SCORED_FIELDS = ("amount", "date", "category", "notes")
+
 
 async def propose_node(state: dict, config) -> dict:
     calls = state["messages"][-1].tool_calls
@@ -48,7 +53,8 @@ async def propose_node(state: dict, config) -> dict:
             **bump,
         }
 
-    actions = [_build_action(c, state["messages"]) for c in calls]
+    entry_method = state.get("entry_method", "assistant")
+    actions = [_build_action(c, state["messages"], entry_method) for c in calls]
 
     unresolved = [a for a in actions if a.get("unresolved")]
     if unresolved:
@@ -69,8 +75,10 @@ async def propose_node(state: dict, config) -> dict:
 
     decision = interrupt({"actions": [_public(a) for a in shown]})
     selected = set((decision or {}).get("selected") or [])
+    edits = (decision or {}).get("edits") or {}
+    trace = (config.get("configurable") or {}).get("trace")
 
-    out = [await _apply(a, a["id"] in selected) for a in shown]
+    out = [await _apply(a, a["id"] in selected, edits.get(a["id"]), trace) for a in shown]
     for a in overflow:
         out.append(
             _tool_msg(
@@ -84,11 +92,16 @@ async def propose_node(state: dict, config) -> dict:
 # --- building the card ----------------------------------------------------
 
 
-def _build_action(call: dict, messages: list) -> dict:
+def _build_action(call: dict, messages: list, entry_method: str) -> dict:
     name = call["name"]
     kind, entity = tool_defs.write_kind(name)
     args = {k: v for k, v in call["args"].items() if v is not None}
-    action: dict[str, Any] = {"id": call["id"], "tool": name, "call_args": dict(args)}
+    action: dict[str, Any] = {
+        "id": call["id"],
+        "tool": name,
+        "call_args": dict(args),
+        "entry_method": entry_method,
+    }
 
     if name in ("create_expense", "create_income", "add_category", "add_source"):
         return {
@@ -166,15 +179,18 @@ def _public(action: dict) -> dict:
 # --- applying the approved subset ----------------------------------------
 
 
-async def _apply(action: dict, approved: bool) -> ToolMessage:
+async def _apply(action: dict, approved: bool, edits: dict | None, trace: Any) -> ToolMessage:
     ref = {"id": action["id"], "name": action["tool"]}
     if not approved:
         return _tool_msg(ref, "Skipped by the member.")
 
     call_args = dict(action["call_args"])
+    if edits:
+        call_args.update(edits)
     if action.get("if_modified_since"):
         call_args["if_modified_since"] = action["if_modified_since"]
 
+    entry_token = tool_defs.bind_entry_method(action.get("entry_method", "assistant"))
     try:
         result = await tool_defs.BY_NAME[action["tool"]](**call_args)
     except FrappeError as exc:
@@ -185,8 +201,34 @@ async def _apply(action: dict, approved: bool) -> ToolMessage:
                 "if the change is still wanted.",
             )
         return _tool_msg(ref, f"Could not apply: {exc.detail}")
+    finally:
+        tool_defs.reset_entry_method(entry_token)
 
+    _score_receipt_accuracy(action, call_args, trace)
     return _tool_msg(ref, _applied_text(action, result))
+
+
+def _score_receipt_accuracy(action: dict, call_args: dict, trace: Any) -> None:
+    """The confirm-time correction signal (ADR 0003): field-level agreement
+    between what the vision call proposed and what the Member confirmed, after
+    any inline edits. Posted on the resume leg's own trace (P7-S1) — that's
+    where the comparison itself happens, not the original `/chat` trace that
+    ran the vision call."""
+    if (
+        trace is None
+        or action.get("entry_method") != "receipt"
+        or action["tool"] != "create_expense"
+    ):
+        return
+    proposed = action.get("values") or {}
+    for field in _SCORED_FIELDS:
+        proposed_value = proposed.get(field)
+        if proposed_value is None:
+            continue
+        confirmed_value = call_args.get(field)
+        trace.score(
+            f"receipt_accuracy_{field}", 1.0 if str(proposed_value) == str(confirmed_value) else 0.0
+        )
 
 
 def _applied_text(action: dict, result: Any) -> str:

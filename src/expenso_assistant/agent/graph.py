@@ -18,7 +18,7 @@ from datetime import date
 from typing import Annotated, Any, TypedDict
 
 from langchain_core.language_models import BaseChatModel
-from langchain_core.messages import AnyMessage, SystemMessage
+from langchain_core.messages import AnyMessage, HumanMessage, SystemMessage
 from langchain_core.tools import StructuredTool
 from langgraph.checkpoint.base import BaseCheckpointSaver
 from langgraph.graph import END, START, StateGraph
@@ -38,6 +38,12 @@ class ToolCapExceeded(RuntimeError):
 class AgentState(TypedDict):
     messages: Annotated[list[AnyMessage], add_messages]
     tool_call_count: int
+    # Reset fresh in `inputs` at the start of every `/chat` turn (like
+    # `tool_call_count`), so it's a pure function of state — unlike the
+    # `tools.py` contextvar, which reads back as "assistant" on the resume
+    # replay of `propose_node` (P7-S1 grill: the node re-runs from the top on
+    # resume, so anything it reads must survive in state, not ambient context).
+    entry_method: str
 
 
 def bound_tool_names(tools: Sequence[Callable[..., Any]] | None = None) -> set[str]:
@@ -68,7 +74,9 @@ def build_graph(
             raise ToolCapExceeded(f"more than {max_tool_calls} tool calls in one turn")
         today = date.fromisoformat(config["configurable"]["today"])
         prompt = SystemMessage(render_system_prompt(today))
-        reply = await model_with_tools.ainvoke([prompt, *state["messages"]], config)
+        image = (config.get("configurable") or {}).get("receipt_image")
+        messages = _with_receipt_image(state["messages"], image)
+        reply = await model_with_tools.ainvoke([prompt, *messages], config)
         return {"messages": [reply]}
 
     async def tools_node(state: AgentState, config) -> dict:
@@ -97,3 +105,23 @@ def build_graph(
 
 def _resolve_tools(tools: Sequence[Callable[..., Any]] | None) -> list[Callable[..., Any]]:
     return list(tools if tools is not None else tool_defs.ALL_TOOLS)
+
+
+def _with_receipt_image(messages: list[AnyMessage], image: str | None) -> list[AnyMessage]:
+    """A transient copy of `messages` for one model call, with the newest
+    `HumanMessage` turned multimodal (P7-S1). Never returned from `agent_node`,
+    so the image never reaches checkpointed state — re-built on every loop
+    iteration in the turn since each model call is otherwise stateless."""
+    if not image:
+        return messages
+    for i in range(len(messages) - 1, -1, -1):
+        if isinstance(messages[i], HumanMessage):
+            text = messages[i].content if isinstance(messages[i].content, str) else ""
+            multimodal = HumanMessage(
+                content=[
+                    {"type": "text", "text": text},
+                    {"type": "image_url", "image_url": {"url": image}},
+                ]
+            )
+            return [*messages[:i], multimodal, *messages[i + 1 :]]
+    return messages

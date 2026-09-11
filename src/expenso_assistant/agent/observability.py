@@ -25,6 +25,7 @@ from ..config import cost_for, get_settings
 logger = logging.getLogger(__name__)
 
 FEATURE_CHAT = "chat"
+FEATURE_RECEIPT = "receipt"
 
 _client: Langfuse | None = None
 
@@ -51,12 +52,17 @@ def reset_langfuse_client() -> None:
 
 
 def within_daily_chat_cap(user_id: str) -> bool:
-    """Whether this Member may start another chat turn today. Fails **open**
-    (ADR 0008) — a Langfuse outage never blocks a turn; the per-run caps still
-    bound it."""
+    """Whether this Member may start another chat or receipt turn today — the
+    two share one cap (P7-S1 grill: receipt volume is low and vision cost is
+    already bounded per-run, so a second config knob isn't worth it). Fails
+    **open** (ADR 0008) — a Langfuse outage never blocks a turn; the per-run
+    caps still bound it."""
     cap = get_settings().daily_chat_cap
     try:
-        return _count_today(user_id, FEATURE_CHAT, cap) < cap
+        counted = sum(
+            _count_today(user_id, feature, cap) for feature in (FEATURE_CHAT, FEATURE_RECEIPT)
+        )
+        return counted < cap
     except Exception as exc:
         logger.warning("daily-cap check failed open for %s: %s", user_id, exc)
         return True
@@ -94,14 +100,16 @@ class TurnTrace:
         self.callback = CostCallback(trace, model)
 
     @classmethod
-    def start(cls, *, user_id: str, session_id: str, user_input: str) -> TurnTrace:
+    def start(
+        cls, *, user_id: str, session_id: str, user_input: str, feature: str = FEATURE_CHAT
+    ) -> TurnTrace:
         trace = langfuse_client().trace(
             name="chat-turn",
             user_id=user_id,
             session_id=session_id,
             input=user_input,
-            tags=[f"feature:{FEATURE_CHAT}"],
-            metadata={"feature": FEATURE_CHAT},
+            tags=[f"feature:{feature}"],
+            metadata={"feature": feature},
         )
         return cls(trace, get_settings().openai_model)
 
@@ -114,6 +122,9 @@ class TurnTrace:
 
     def fail(self, code: str) -> None:
         self._trace.update(level="ERROR", status_message=code)
+
+    def score(self, name: str, value: float) -> None:
+        self._trace.score(name=name, value=value)
 
 
 class CostCallback(BaseCallbackHandler):

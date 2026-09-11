@@ -78,6 +78,7 @@ class SpyTrace:
         self.init = init
         self.updates: list[dict] = []
         self.generations: list[dict] = []
+        self.scores: list[dict] = []
 
     def update(self, **kwargs) -> None:
         self.updates.append(kwargs)
@@ -86,10 +87,22 @@ class SpyTrace:
         self.generations.append(kwargs)
         return self
 
+    def score(self, **kwargs) -> None:
+        self.scores.append(kwargs)
+
 
 class SpyLangfuse:
-    def __init__(self, *, today_trace_count: int = 0, fetch_raises: Exception | None = None):
+    def __init__(
+        self,
+        *,
+        today_trace_count: int = 0,
+        today_trace_counts: dict[str, int] | None = None,
+        fetch_raises: Exception | None = None,
+    ):
         self._today = today_trace_count
+        # Per-`feature:<x>` tag override — falls back to `_today` for any tag
+        # not listed, so existing single-feature tests are unaffected.
+        self._today_by_tag = today_trace_counts or {}
         self._fetch_raises = fetch_raises
         self.traces: list[SpyTrace] = []
         self.fetch_calls: list[dict] = []
@@ -104,7 +117,9 @@ class SpyLangfuse:
         self.fetch_calls.append(kwargs)
         if self._fetch_raises is not None:
             raise self._fetch_raises
-        return SimpleNamespace(data=[object()] * self._today)
+        tag = (kwargs.get("tags") or [None])[0]
+        count = self._today_by_tag.get(tag, self._today)
+        return SimpleNamespace(data=[object()] * count)
 
     def flush(self) -> None:
         self.flushed += 1
