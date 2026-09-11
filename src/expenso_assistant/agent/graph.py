@@ -106,7 +106,13 @@ def build_graph(
         return result
 
     def route(state: AgentState) -> str:
-        calls = getattr(state["messages"][-1], "tool_calls", None)
+        messages = state["messages"]
+        if not messages:
+            # A proactive thread's state can be emptied by `discard_pending`
+            # clearing a stale interactive proposal (no persisted HumanMessage
+            # ever anchors it) — expenso-assistant#1. Nothing to route on.
+            return END
+        calls = getattr(messages[-1], "tool_calls", None)
         if not calls:
             return END
         if any(c["name"] in tool_defs.WRITE_TOOL_NAMES for c in calls):
@@ -165,10 +171,23 @@ def _windowed(
     below: computed fresh before each model call, never returned from
     `agent_node`, so the checkpoint (and everything `GET /history` replays)
     stays the full, ever-growing thread the GLOSSARY promises — only what's
-    sent to the model is bounded. `start_on="human"` keeps the window from
-    starting mid a tool-call/tool-result pair, which OpenAI's API rejects."""
+    sent to the model is bounded. `start_on=("human", "ai")` keeps the window
+    from starting mid a tool-call/tool-result pair, which OpenAI's API
+    rejects — a `ToolMessage` is never a valid start. It also fixes a real bug
+    (expenso-assistant#1): a proactive run's `state["messages"]` never carries
+    a persisted `HumanMessage` (the instruction lives in `config`, injected by
+    `_with_proactive_instruction` after this runs), so after the first
+    tool-call cycle the window was `[AIMessage(tool_call), ToolMessage(...)]`
+    with no `human` anchor at all — `start_on="human"` alone returned `[]`,
+    silently dropping the tool result every cycle and looping until
+    `ToolCapExceeded`. Allowing an `ai` start lets the window begin at that
+    `AIMessage` instead."""
     return trim_messages(
-        messages, max_tokens=budget, token_counter=count_tokens, strategy="last", start_on="human"
+        messages,
+        max_tokens=budget,
+        token_counter=count_tokens,
+        strategy="last",
+        start_on=("human", "ai"),
     )
 
 

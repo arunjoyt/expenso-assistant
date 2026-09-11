@@ -16,7 +16,7 @@ from expenso_assistant.config import get_settings
 
 from .conftest import API, method_url
 from .fakes import ScriptedChatModel
-from .test_agent_session import answer, run_turn
+from .test_agent_session import answer, run_turn, tool_call
 from .test_agent_writes import multi_call
 
 pytestmark = pytest.mark.usefixtures("spy_langfuse_default")
@@ -52,6 +52,41 @@ async def test_monthly_summary_always_calls_the_model_and_posts_a_tagged_insight
     assert history[0]["role"] == "assistant"
     assert history[0]["kind"] == "insight"
     assert history[0]["posted_at"]
+    assert history[0]["content"] == "August was quiet — you spent 100."
+
+
+@respx.mock
+async def test_monthly_summary_survives_a_tool_call_before_the_answer(member):
+    """expenso-assistant#1 regression: a proactive run's `state["messages"]`
+    never carries a persisted `HumanMessage` (the instruction lives in
+    `config`, injected after `_windowed` runs), so once the model makes a
+    tool call, the second `agent_node` cycle used to see
+    `[AIMessage(tool_call), ToolMessage(...)]` with no `human` anchor at all —
+    `_windowed`'s `start_on="human"` trim returned `[]`, silently dropping the
+    tool result every cycle, so the model re-issued the same call forever and
+    the run died to `ToolCapExceeded` without ever posting an Insight. This is
+    exactly the path the proactive system prompt tells the model to take
+    ("read what you need") and the one the pre-fix test suite never scripted."""
+    respx.get(method_url(f"{API}.get_expenses")).mock(
+        return_value=httpx.Response(200, json={"message": [{"amount": 100, "category": "Food"}]})
+    )
+    model = ScriptedChatModel(
+        responses=[
+            tool_call("get_expenses", month=8, year=2026),
+            answer("August was quiet — you spent 100."),
+        ]
+    )
+    graph = build_graph(model, checkpointer=InMemorySaver(), tools=tool_defs.READ_TOOLS)
+    settings = get_settings()
+
+    await proactive.run_proactive_job(
+        job=proactive.JOB_MONTHLY_SUMMARY, member=member, graph=graph, settings=settings
+    )
+
+    assert model.calls == 2
+    history = await session.history(graph, member, settings)
+    assert len(history) == 1
+    assert history[0]["kind"] == "insight"
     assert history[0]["content"] == "August was quiet — you spent 100."
 
 
