@@ -77,8 +77,8 @@ async def test_reading_receipt_step_precedes_everything(member):
     assert events[0] == ("step", {"text": "Reading the receipt…"})
 
 
-async def test_receipt_turns_share_the_chat_daily_cap(member, spy_langfuse):
-    spy_langfuse(today_trace_counts={"feature:chat": get_settings().daily_chat_cap})
+async def test_receipt_turns_share_the_chat_daily_cap(member, spy_token_store):
+    spy_token_store(today_tokens=get_settings().daily_token_cap)
     model = ScriptedChatModel(responses=[])  # any call would IndexError
     graph = build_graph(model, checkpointer=InMemorySaver())
 

@@ -57,27 +57,22 @@ async def test_generation_cost_discounts_cache_and_bills_reasoning_as_output(mem
     assert round(spy.traces[0].generations[0]["cost_details"]["total"], 6) == 0.675
 
 
-async def test_daily_cap_query_shape(member, spy):
-    model = ScriptedChatModel(responses=[answer("Hi.")])
-    graph = build_graph(model, checkpointer=InMemorySaver())
-
-    await run_turn(graph, member, "hello")
-
-    # The chat cap is shared with receipt turns (P7-S1) — one query per feature tag.
-    assert len(spy.fetch_calls) == 2
-    tags = {tuple(call["tags"]) for call in spy.fetch_calls}
-    assert tags == {("feature:chat",), ("feature:receipt",)}
-    for call in spy.fetch_calls:
-        assert call["user_id"] == member.email
-        assert call["limit"] == get_settings().daily_chat_cap
-        assert "from_timestamp" in call
-
-
-async def test_daily_cap_checked_before_this_runs_own_trace_opens(member, spy_langfuse):
-    spy = spy_langfuse(today_trace_count=get_settings().daily_chat_cap)
+async def test_daily_cap_checked_before_this_runs_own_trace_opens(member, spy, spy_token_store):
+    spy_token_store(today_tokens=get_settings().daily_token_cap)
     model = ScriptedChatModel(responses=[])
     graph = build_graph(model, checkpointer=InMemorySaver())
 
     await run_turn(graph, member, "hello")
 
-    assert spy.fetch_calls and spy.traces == []
+    assert spy.traces == []
+
+
+async def test_generation_tokens_are_recorded_against_the_daily_total(member, spy_token_store):
+    spy = spy_token_store()
+    model = ScriptedChatModel(responses=[answer("Hi.", inp=1_000, out=50)])
+    graph = build_graph(model, checkpointer=InMemorySaver())
+
+    await run_turn(graph, member, "hello")
+
+    assert spy.added == [(member.email, 1_050)]
+    assert spy.get(member.email, None) == 1_050

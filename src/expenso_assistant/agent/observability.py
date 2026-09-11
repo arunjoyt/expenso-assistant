@@ -1,4 +1,4 @@
-"""Langfuse tracing, the explicit-cost callback, and the daily-cap query.
+"""Langfuse tracing, the explicit-cost callback, and the daily token cap.
 
 ADR 0008: Langfuse is the *only* record of an LLM call. Every turn opens one
 trace tagged `user_id` / `metadata.feature` / `session_id` (no `family` — see the
@@ -7,12 +7,17 @@ computes from `config.MODEL_PRICING` — never Langfuse's own model-price table.
 
 The stock `langfuse.callback.CallbackHandler` is deliberately not used: it defers
 cost to Langfuse's catalog, and it drags in the full `langchain` meta-package.
+
+The daily cap (`within_daily_token_cap`) is the one exception to "Langfuse is
+the only record": it reads a same-day token total from a small Postgres
+counter, not from Langfuse (ADR 0008's 2026-09-11 update) — see
+`PostgresTokenStore`'s docstring for why that doesn't reopen the rule above.
 """
 
 from __future__ import annotations
 
 import logging
-from datetime import datetime
+from datetime import date, datetime
 from typing import Any
 from zoneinfo import ZoneInfo
 
@@ -26,8 +31,8 @@ logger = logging.getLogger(__name__)
 
 FEATURE_CHAT = "chat"
 FEATURE_RECEIPT = "receipt"
-# Proactive scheduled runs (P7-S2) — never counted against `daily_chat_cap`
-# (see `within_daily_chat_cap` below): volume is inherently tiny (at most one
+# Proactive scheduled runs (P7-S2) — never counted against `daily_token_cap`
+# (see `within_daily_token_cap` below): volume is inherently tiny (at most one
 # monthly + one weekly LLM call per Member, and the budget-drift pre-check
 # skips the LLM call most weeks), so a separate cap isn't worth the config
 # surface.
@@ -57,41 +62,86 @@ def reset_langfuse_client() -> None:
 # --- daily cap -------------------------------------------------------------
 
 
-def within_daily_chat_cap(user_id: str) -> bool:
-    """Whether this Member may start another chat or receipt turn today — the
-    two share one cap (P7-S1 grill: receipt volume is low and vision cost is
-    already bounded per-run, so a second config knob isn't worth it). Fails
-    **open** (ADR 0008) — a Langfuse outage never blocks a turn; the per-run
-    caps still bound it."""
-    cap = get_settings().daily_chat_cap
-    try:
-        counted = sum(
-            _count_today(user_id, feature, cap) for feature in (FEATURE_CHAT, FEATURE_RECEIPT)
+class PostgresTokenStore:
+    """The daily per-Member token total backing `within_daily_token_cap`
+    (ADR 0008's 2026-09-11 update, replacing the turn-count `daily_chat_cap`).
+    A same-day, increment-only numeric aggregate with no per-call detail —
+    not a record of an LLM call, so this does not reopen this module's
+    "Langfuse is the *only* record" rule above. Lives as a table in the
+    LangGraph checkpointer's own Postgres (`config.database_url`), not a new
+    datastore."""
+
+    def __init__(self, database_url: str):
+        import psycopg
+
+        self._conn = psycopg.connect(database_url, autocommit=True)
+        self._conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS assistant_daily_token_usage (
+                user_id TEXT NOT NULL,
+                usage_date DATE NOT NULL,
+                tokens BIGINT NOT NULL DEFAULT 0,
+                PRIMARY KEY (user_id, usage_date)
+            )
+            """
         )
-        return counted < cap
-    except Exception as exc:
-        logger.warning("daily-cap check failed open for %s: %s", user_id, exc)
-        return True
+
+    def get(self, user_id: str, today: date) -> int:
+        row = self._conn.execute(
+            "SELECT tokens FROM assistant_daily_token_usage WHERE user_id = %s AND usage_date = %s",
+            (user_id, today),
+        ).fetchone()
+        return row[0] if row else 0
+
+    def add(self, user_id: str, today: date, tokens: int) -> None:
+        self._conn.execute(
+            """
+            INSERT INTO assistant_daily_token_usage (user_id, usage_date, tokens)
+            VALUES (%s, %s, %s)
+            ON CONFLICT (user_id, usage_date)
+            DO UPDATE SET tokens = assistant_daily_token_usage.tokens + EXCLUDED.tokens
+            """,
+            (user_id, today, tokens),
+        )
 
 
-def _count_today(user_id: str, feature: str, limit: int) -> int:
-    """Traces opened for this Member + feature since local midnight. Capped at
-    `limit` — the caller only needs the "< cap?" answer. Must run *before* this
-    turn's own trace opens, or it counts itself."""
-    start = _local_midnight()
-    result = langfuse_client().fetch_traces(
-        user_id=user_id,
-        tags=[f"feature:{feature}"],
-        from_timestamp=start,
-        to_timestamp=datetime.now(start.tzinfo),
-        limit=limit,
-    )
-    return len(result.data)
+_token_store: Any | None = None
+
+
+def token_store() -> Any:
+    global _token_store
+    if _token_store is None:
+        _token_store = PostgresTokenStore(get_settings().database_url)
+    return _token_store
+
+
+def reset_token_store() -> None:
+    """Drop the cached store — tests and a settings reload call this."""
+    global _token_store
+    _token_store = None
+
+
+def within_daily_token_cap(user_id: str) -> bool:
+    """Whether this Member may start another chat or receipt turn today, by
+    cumulative token total rather than turn count — a long message or a
+    tool-heavy/vision turn no longer hides inside a flat per-turn allowance
+    (ADR 0008's 2026-09-11 update). No fail-open branch: the counter's
+    storage is the LangGraph checkpointer's own Postgres, already a hard
+    dependency for the turn to run at all, so a failure here surfaces the
+    same way a checkpointer failure downstream would — the caller (`session.
+    stream_turn`) turns any exception into the turn's ordinary 'internal'
+    error rather than silently permitting the turn."""
+    cap = get_settings().daily_token_cap
+    return token_store().get(user_id, _local_today()) < cap
 
 
 def _local_midnight() -> datetime:
     now = datetime.now(ZoneInfo(get_settings().service_timezone))
     return now.replace(hour=0, minute=0, second=0, microsecond=0)
+
+
+def _local_today() -> date:
+    return _local_midnight().date()
 
 
 # --- per-turn trace + cost ------------------------------------------------
@@ -101,9 +151,9 @@ class TurnTrace:
     """One Langfuse trace for one chat turn, plus the callback that records each
     generation's cost explicitly."""
 
-    def __init__(self, trace: Any, model: str):
+    def __init__(self, trace: Any, model: str, user_id: str):
         self._trace = trace
-        self.callback = CostCallback(trace, model)
+        self.callback = CostCallback(trace, model, user_id)
 
     @classmethod
     def start(
@@ -117,7 +167,7 @@ class TurnTrace:
             tags=[f"feature:{feature}"],
             metadata={"feature": feature},
         )
-        return cls(trace, get_settings().openai_model)
+        return cls(trace, get_settings().openai_model, user_id)
 
     @property
     def total_cost(self) -> float:
@@ -134,9 +184,10 @@ class TurnTrace:
 
 
 class CostCallback(BaseCallbackHandler):
-    def __init__(self, trace: Any, model: str):
+    def __init__(self, trace: Any, model: str, user_id: str):
         self._trace = trace
         self._model = model
+        self._user_id = user_id
         self.total_cost = 0.0
 
     def on_llm_end(self, response: LLMResult, **_: Any) -> None:
@@ -154,6 +205,16 @@ class CostCallback(BaseCallbackHandler):
             },
             cost_details={"total": cost},
         )
+        # Best-effort bookkeeping, unlike the gate in `within_daily_token_cap`:
+        # the call already happened and the cost is already incurred, so a
+        # failure here is logged and swallowed rather than failing the turn
+        # after the fact (same trade-off as `_flush_trace`'s Langfuse flush).
+        try:
+            token_store().add(
+                self._user_id, _local_today(), usage["input_tokens"] + usage["output_tokens"]
+            )
+        except Exception as exc:
+            logger.warning("daily token counter update failed for %s: %s", self._user_id, exc)
 
 
 def _usage_from_result(response: LLMResult) -> dict[str, int]:

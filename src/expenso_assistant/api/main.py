@@ -102,6 +102,8 @@ def create_app(*, graph=None, checkpointer=None, read_only_graph=None) -> FastAP
 
     @app.post("/chat")
     async def chat(body: ChatIn, request: Request, member: AuthedMember = MemberDep):
+        if len(body.message) > settings.max_chat_message_chars:
+            raise HTTPException(413, "message is too long")
         if body.image and len(body.image) > settings.max_receipt_image_chars:
             raise HTTPException(413, "image is too large")
         stream = session.stream_turn(

@@ -15,10 +15,12 @@ from __future__ import annotations
 
 from collections.abc import Callable, Sequence
 from datetime import UTC, date, datetime
+from functools import lru_cache
 from typing import Annotated, Any, TypedDict
 
+import tiktoken
 from langchain_core.language_models import BaseChatModel
-from langchain_core.messages import AnyMessage, HumanMessage, SystemMessage
+from langchain_core.messages import AnyMessage, HumanMessage, SystemMessage, trim_messages
 from langchain_core.tools import StructuredTool
 from langgraph.checkpoint.base import BaseCheckpointSaver
 from langgraph.graph import END, START, StateGraph
@@ -68,6 +70,8 @@ def build_graph(
     model_with_tools = model.bind_tools(lc_tools)
     tool_node = ToolNode(lc_tools)
     max_tool_calls = get_settings().run_max_tool_calls
+    history_token_budget = get_settings().chat_history_token_budget
+    count_tokens = _token_counter(get_settings().openai_model)
     # No write tool in `fns` means this is a proactive run (P7-S2) — used to pick
     # the system prompt's tone, not a re-check of what's bound (route() already
     # enforces that structurally).
@@ -80,7 +84,8 @@ def build_graph(
         configurable = config.get("configurable") or {}
         instruction = configurable.get("proactive_instruction")
         prompt = SystemMessage(render_system_prompt(today, proactive=read_only))
-        messages = _with_receipt_image(state["messages"], configurable.get("receipt_image"))
+        messages = _windowed(state["messages"], count_tokens, history_token_budget)
+        messages = _with_receipt_image(messages, configurable.get("receipt_image"))
         messages = _with_proactive_instruction(messages, instruction)
         reply = await model_with_tools.ainvoke([prompt, *messages], config)
         if instruction:
@@ -121,6 +126,50 @@ def build_graph(
 
 def _resolve_tools(tools: Sequence[Callable[..., Any]] | None) -> list[Callable[..., Any]]:
     return list(tools if tools is not None else tool_defs.ALL_TOOLS)
+
+
+@lru_cache(maxsize=4)
+def _encoding_for(model_name: str) -> tiktoken.Encoding:
+    try:
+        return tiktoken.encoding_for_model(model_name)
+    except KeyError:
+        return tiktoken.get_encoding("cl100k_base")
+
+
+def _token_counter(model_name: str) -> Callable[[list[AnyMessage]], int]:
+    """A tiktoken-based counter for `_windowed`, deliberately not routed
+    through the bound model's own `get_num_tokens_from_messages`: that works
+    for the real `ChatOpenAI` (tiktoken-backed) but not for a plain
+    `BaseChatModel` double like the test fakes, which fall through to
+    LangChain's default tokenizer and require the `transformers` package.
+    Approximate (content only, no per-message role/name overhead) — fine for
+    a soft budget, not a billing figure."""
+    encoding = _encoding_for(model_name)
+
+    def count(messages: list[AnyMessage]) -> int:
+        total = 0
+        for message in messages:
+            content = message.content
+            text = content if isinstance(content, str) else str(content)
+            total += len(encoding.encode(text))
+        return total
+
+    return count
+
+
+def _windowed(
+    messages: list[AnyMessage], count_tokens: Callable[[list[AnyMessage]], int], budget: int
+) -> list[AnyMessage]:
+    """A transient token-count trim of persisted history (2026-09-11 grill) —
+    the same shape as `_with_receipt_image`/`_with_proactive_instruction`
+    below: computed fresh before each model call, never returned from
+    `agent_node`, so the checkpoint (and everything `GET /history` replays)
+    stays the full, ever-growing thread the GLOSSARY promises — only what's
+    sent to the model is bounded. `start_on="human"` keeps the window from
+    starting mid a tool-call/tool-result pair, which OpenAI's API rejects."""
+    return trim_messages(
+        messages, max_tokens=budget, token_counter=count_tokens, strategy="last", start_on="human"
+    )
 
 
 def _with_receipt_image(messages: list[AnyMessage], image: str | None) -> list[AnyMessage]:

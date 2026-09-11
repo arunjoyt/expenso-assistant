@@ -156,6 +156,30 @@ async def test_chat_rejects_an_oversized_image(monkeypatch, spy_langfuse):
     assert chat.status_code == 413
 
 
+async def test_chat_rejects_an_oversized_message(monkeypatch, spy_langfuse):
+    # Same caveat as the oversized-image test above: the cap is captured by
+    # `create_app` at construction time, so it must be set before building it.
+    from expenso_assistant.api.main import create_app
+    from expenso_assistant.config import get_settings
+
+    monkeypatch.setenv("MAX_CHAT_MESSAGE_CHARS", "10")
+    get_settings.cache_clear()
+    spy_langfuse()
+    checkpointer = InMemorySaver()
+    graph = build_graph(ScriptedChatModel(responses=[]), checkpointer=checkpointer)
+    app = create_app(graph=graph, checkpointer=checkpointer)
+    client = httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test")
+
+    async with client, respx.mock:
+        _wire_frappe()
+        chat = await client.post(
+            "/chat",
+            json={"message": "this message is way over the ten character cap"},
+            headers={"Authorization": "Bearer tok-a"},
+        )
+    assert chat.status_code == 413
+
+
 async def test_clear_chat_empties_the_thread(client):
     async with client, respx.mock:
         _wire_frappe()

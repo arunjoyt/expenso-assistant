@@ -30,7 +30,7 @@ from ..auth import AuthedMember
 from ..config import Settings
 from ..frappe_client import FrappeClient, bind_frappe_client, reset_frappe_client
 from .graph import ToolCapExceeded
-from .observability import FEATURE_CHAT, FEATURE_RECEIPT, TurnTrace, within_daily_chat_cap
+from .observability import FEATURE_CHAT, FEATURE_RECEIPT, TurnTrace, within_daily_token_cap
 
 logger = logging.getLogger(__name__)
 
@@ -64,8 +64,18 @@ def humanize(tool_name: str, args: dict | None) -> str:
 async def stream_turn(
     *, graph, member: AuthedMember, text: str, settings: Settings, image: str | None = None
 ) -> AsyncIterator[str]:
-    if not within_daily_chat_cap(member.email):
-        yield sse("error", {"code": "daily_cap", "message": "You've reached today's chat limit."})
+    # No fail-open here (unlike the old Langfuse-backed cap): the counter's
+    # storage is the checkpointer's own Postgres, already required for the
+    # turn to run at all, so a check failure fails the turn the same way a
+    # checkpointer failure downstream would (ADR 0008's 2026-09-11 update).
+    try:
+        allowed = within_daily_token_cap(member.email)
+    except Exception:
+        logger.exception("daily cap check failed")
+        yield sse("error", {"code": "internal", "message": _ERROR_MESSAGES["internal"]})
+        return
+    if not allowed:
+        yield sse("error", {"code": "daily_cap", "message": "You've reached today's usage limit."})
         return
 
     config = _run_config(member, settings, image=image)
@@ -214,7 +224,7 @@ async def _drive(
         logger.exception("chat turn failed")
         await _rollback(graph, config, pre_ids)
         trace.fail("internal")
-        yield sse("error", {"code": "internal", "message": "The assistant hit an error."})
+        yield sse("error", {"code": "internal", "message": _ERROR_MESSAGES["internal"]})
         return
 
     card = await pending_card(graph, config)
@@ -238,6 +248,7 @@ _ERROR_MESSAGES = {
     "wall_clock": "The assistant took too long and stopped.",
     "recursion": "The assistant got stuck and stopped.",
     "tool_cap": "The assistant tried too many steps and stopped.",
+    "internal": "The assistant hit an error.",
 }
 
 

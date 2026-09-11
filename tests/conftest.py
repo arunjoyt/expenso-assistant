@@ -38,6 +38,33 @@ def spy_langfuse(monkeypatch):
 
 
 @pytest.fixture
+def spy_token_store(monkeypatch):
+    """Replace the Postgres-backed daily token counter with an in-memory spy.
+    Returns a factory so a test can set today's starting total / a get error
+    before the first use."""
+    from expenso_assistant.agent import observability
+
+    from .fakes import SpyTokenStore
+
+    def install(**kwargs) -> SpyTokenStore:
+        spy = SpyTokenStore(**kwargs)
+        monkeypatch.setattr(observability, "_token_store", spy)
+        return spy
+
+    observability.reset_token_store()
+    yield install
+    observability.reset_token_store()
+
+
+@pytest.fixture(autouse=True)
+def _default_token_store(spy_token_store):
+    """Most tests just need a store that reports 'under the cap' — mirrors
+    `spy_langfuse_default` per-file fixtures but applies everywhere, since
+    every turn now touches the token store, not just cap-focused tests."""
+    return spy_token_store()
+
+
+@pytest.fixture
 def member():
     from expenso_assistant.auth import AuthedMember, thread_id_for
 

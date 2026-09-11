@@ -95,8 +95,8 @@ async def test_system_prompt_carries_todays_date(member):
     assert datetime.now(UTC).date().isoformat() in system_text
 
 
-async def test_daily_cap_refuses_before_the_model_is_called(member, spy_langfuse):
-    spy_langfuse(today_trace_count=get_settings().daily_chat_cap)
+async def test_daily_cap_refuses_before_the_model_is_called(member, spy_token_store):
+    spy_token_store(today_tokens=get_settings().daily_token_cap)
     model = ScriptedChatModel(responses=[])  # any call would IndexError
     graph = build_graph(model, checkpointer=InMemorySaver())
 
@@ -107,15 +107,50 @@ async def test_daily_cap_refuses_before_the_model_is_called(member, spy_langfuse
     assert model.calls == 0
 
 
-async def test_daily_cap_check_fails_open_when_langfuse_is_down(member, spy_langfuse, caplog):
-    spy_langfuse(fetch_raises=httpx.ConnectError("down"))
-    model = ScriptedChatModel(responses=[answer("still works")])
+async def test_daily_cap_check_failure_surfaces_as_the_ordinary_internal_error(
+    member, spy_token_store
+):
+    """No fail-open branch (2026-09-11 update): the counter's own Postgres is
+    already required for the turn to run at all, so a check failure fails the
+    turn like any other internal error rather than silently permitting it."""
+    spy_token_store(get_raises=RuntimeError("db down"))
+    model = ScriptedChatModel(responses=[answer("never reached")])
     graph = build_graph(model, checkpointer=InMemorySaver())
 
     events = await run_turn(graph, member, "hi")
 
-    assert events[-1][0] == "done"
-    assert "failed open" in caplog.text
+    assert len(events) == 1
+    assert events[0] == ("error", {"code": "internal", "message": "The assistant hit an error."})
+    assert model.calls == 0
+
+
+async def test_a_turns_tokens_are_added_to_the_daily_total(member, spy_token_store):
+    spy = spy_token_store()
+    model = ScriptedChatModel(responses=[answer("Hi.", inp=100, out=20)])
+    graph = build_graph(model, checkpointer=InMemorySaver())
+
+    await run_turn(graph, member, "hello")
+
+    assert spy.added == [(member.email, 120)]
+
+
+async def test_old_turns_drop_from_what_the_model_sees_but_stay_in_history(member, monkeypatch):
+    """2026-09-11 update: the window is transient, not a checkpoint prune —
+    the model stops seeing the earliest turn once the thread outgrows the
+    budget, but `GET /history` (via `session.history`) still has it."""
+    monkeypatch.setenv("CHAT_HISTORY_TOKEN_BUDGET", "30")
+    get_settings.cache_clear()
+    model = ScriptedChatModel(responses=[answer("ok")] * 4)
+    graph = build_graph(model, checkpointer=InMemorySaver())
+
+    for i in range(4):
+        await run_turn(graph, member, f"turn number {i} padded with some extra words")
+
+    sent_texts = [m.content for m in model.last_prompt if isinstance(m.content, str)]
+    assert not any("turn number 0" in text for text in sent_texts)
+
+    full_history = await session.history(graph, member, get_settings())
+    assert any("turn number 0" in (entry.get("content") or "") for entry in full_history)
 
 
 async def test_wall_clock_cap_ends_in_error_with_no_partial_answer(member, monkeypatch):

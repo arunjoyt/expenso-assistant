@@ -91,6 +91,26 @@ class SpyTrace:
         self.scores.append(kwargs)
 
 
+class SpyTokenStore:
+    """Fake for `observability.PostgresTokenStore` — an in-memory dict keyed by
+    user_id (tests run within one 'today', so the date dimension is dropped)."""
+
+    def __init__(self, *, today_tokens: int = 0, get_raises: Exception | None = None):
+        self._default = today_tokens
+        self._get_raises = get_raises
+        self.totals: dict[str, int] = {}
+        self.added: list[tuple[str, int]] = []
+
+    def get(self, user_id: str, today) -> int:
+        if self._get_raises is not None:
+            raise self._get_raises
+        return self.totals.get(user_id, self._default)
+
+    def add(self, user_id: str, today, tokens: int) -> None:
+        self.added.append((user_id, tokens))
+        self.totals[user_id] = self.totals.get(user_id, self._default) + tokens
+
+
 class SpyLangfuse:
     def __init__(
         self,

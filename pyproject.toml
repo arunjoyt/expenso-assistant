@@ -16,6 +16,7 @@ dependencies = [
     "langgraph>=0.2",
     "langchain-core>=0.3",
     "langchain-openai>=0.2",
+    "tiktoken>=0.7",
     "langgraph-checkpoint-postgres>=2.0",
     "psycopg[binary]>=3.2",
     "langfuse>=2.50,<3",

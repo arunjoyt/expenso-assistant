@@ -103,8 +103,24 @@ class Settings(BaseSettings):
     run_max_tool_calls: int = 20
     run_wall_clock_seconds: int = 90
 
-    # Per-Member daily chat cap, counted from Langfuse, fail-open (P6-S5).
-    daily_chat_cap: int = 50
+    # Per-Member daily token cap — input+output tokens across chat/receipt
+    # turns, counted from a local Postgres total rather than Langfuse. No
+    # fail-open: the counter lives in the checkpointer's own Postgres, already
+    # a hard dependency for a turn to run at all (ADR 0008's 2026-09-11 update
+    # — replaces the old turn-count `daily_chat_cap`).
+    daily_token_cap: int = 500_000
+
+    # How much of a thread's persisted history is resent to the model on each
+    # turn — bounds the token count, not the message count, since tool-result
+    # messages vary hugely in size (ADR 0008's 2026-09-11 update). Applied
+    # transiently in `agent_node`; the checkpointed thread itself is never
+    # trimmed, so `GET /history` and "Clear chat" are unaffected.
+    chat_history_token_budget: int = 20_000
+
+    # A secondary bound alongside the daily token cap: no single message can
+    # consume an outsized share of one day's budget in one turn (ADR 0008's
+    # 2026-09-11 update).
+    max_chat_message_chars: int = 4_000
 
     # Confirm-card batch cap (P6-S7): the propose node shows at most this many
     # proposed writes per card and tells the model to continue with the rest.
