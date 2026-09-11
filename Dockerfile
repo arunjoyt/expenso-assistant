@@ -9,13 +9,13 @@ ENV UV_COMPILE_BYTECODE=1 \
 
 WORKDIR /app
 
-# Install deps first for layer caching. Include the `agent` extra so the image
-# is ready for P6-S5 without a rebuild.
+# Install deps first for layer caching. The agent's dependencies are core
+# (main `dependencies`, not an extra) since P6-S5.
 COPY pyproject.toml uv.lock* ./
-RUN uv sync --extra agent --no-install-project --no-dev
+RUN uv sync --no-install-project --no-dev
 
 COPY . .
-RUN uv sync --extra agent --no-dev
+RUN uv sync --no-dev
 
 EXPOSE 8080
 CMD ["uvicorn", "expenso_assistant.api.main:app", "--host", "0.0.0.0", "--port", "8080"]
