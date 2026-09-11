@@ -6,6 +6,8 @@
 - `POST /resume` — decision on a pending confirm card (endpoint shell in P6-S5;
   the proposal node and real payload land in P6-S7)
 - `GET  /history` / `DELETE /history` — the Member's thread
+- `POST /run/proactive` — the Frappe scheduler's per-Member trigger (P7-S2);
+  fire-and-forget, `202` immediately, the graph runs as a background task
 
 Every Assistant endpoint derives the thread from the token's Member — no client
 ever supplies a thread id (P6-S5 grill).
@@ -15,13 +17,14 @@ from __future__ import annotations
 
 from contextlib import AsyncExitStack, asynccontextmanager
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import BackgroundTasks, FastAPI, HTTPException, Request, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
 from .. import __version__
-from ..agent import session
+from .. import tools as tool_defs
+from ..agent import proactive, session
 from ..agent.graph import build_graph
 from ..agent.model import build_model
 from ..auth import AuthedMember, MemberDep
@@ -43,7 +46,11 @@ class ResumeIn(BaseModel):
     decision: dict = {}
 
 
-def create_app(*, graph=None, checkpointer=None) -> FastAPI:
+class ProactiveIn(BaseModel):
+    job: str
+
+
+def create_app(*, graph=None, checkpointer=None, read_only_graph=None) -> FastAPI:
     settings = get_settings()
     injected = graph is not None and checkpointer is not None
 
@@ -60,10 +67,16 @@ def create_app(*, graph=None, checkpointer=None) -> FastAPI:
                 await stack.enter_async_context(mcp_app.lifespan(mcp_app))
             if injected:
                 app.state.graph, app.state.checkpointer = graph, checkpointer
+                app.state.read_only_graph = read_only_graph
             else:
                 app.state.checkpointer = await _build_checkpointer(stack, settings.database_url)
-                app.state.graph = build_graph(
-                    build_model(settings), checkpointer=app.state.checkpointer
+                model = build_model(settings)
+                app.state.graph = build_graph(model, checkpointer=app.state.checkpointer)
+                # A separate compiled graph bound to READ_TOOLS only, sharing
+                # the same checkpointer/thread — proactive runs (P7-S2) can
+                # never produce a write tool-call, a binding-level guarantee.
+                app.state.read_only_graph = build_graph(
+                    model, checkpointer=app.state.checkpointer, tools=tool_defs.READ_TOOLS
                 )
             yield
         await aclose_http()
@@ -71,6 +84,7 @@ def create_app(*, graph=None, checkpointer=None) -> FastAPI:
     app = FastAPI(title="expenso-assistant", version=__version__, lifespan=lifespan)
     if injected:  # tests skip the lifespan; wire state up front
         app.state.graph, app.state.checkpointer = graph, checkpointer
+        app.state.read_only_graph = read_only_graph
 
     # The in-app Assistant tab calls /chat from the Frappe origin (P6-S6). The
     # bearer rides an Authorization header, so that header must be allowed.
@@ -114,6 +128,22 @@ def create_app(*, graph=None, checkpointer=None) -> FastAPI:
     async def clear_history(request: Request, member: AuthedMember = MemberDep) -> dict:
         await session.clear_thread(request.app.state.checkpointer, member)
         return {"status": "cleared"}
+
+    @app.post("/run/proactive", status_code=status.HTTP_202_ACCEPTED)
+    async def run_proactive(
+        body: ProactiveIn,
+        background_tasks: BackgroundTasks,
+        request: Request,
+        member: AuthedMember = MemberDep,
+    ) -> dict:
+        background_tasks.add_task(
+            proactive.run_proactive_job,
+            job=body.job,
+            member=member,
+            graph=request.app.state.read_only_graph,
+            settings=settings,
+        )
+        return {"status": "accepted"}
 
     if mcp_app is not None:
         app.mount("/mcp", mcp_app)

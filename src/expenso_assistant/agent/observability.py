@@ -26,6 +26,12 @@ logger = logging.getLogger(__name__)
 
 FEATURE_CHAT = "chat"
 FEATURE_RECEIPT = "receipt"
+# Proactive scheduled runs (P7-S2) — never counted against `daily_chat_cap`
+# (see `within_daily_chat_cap` below): volume is inherently tiny (at most one
+# monthly + one weekly LLM call per Member, and the budget-drift pre-check
+# skips the LLM call most weeks), so a separate cap isn't worth the config
+# surface.
+FEATURE_INSIGHTS = "insights"
 
 _client: Langfuse | None = None
 

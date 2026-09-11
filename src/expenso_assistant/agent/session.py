@@ -74,7 +74,7 @@ async def stream_turn(
 
     # A new message while a confirm card is open means the member moved on — the
     # thread is linear. Drop the unconfirmed proposal and carry on (P6-S7).
-    if await _discard_pending(graph, config):
+    if await discard_pending(graph, config):
         yield sse("step", {"text": "Discarded the unconfirmed changes"})
 
     if image:
@@ -112,7 +112,7 @@ async def resume_turn(
     subset (P6-S7) and streams the continuation on a fresh SSE leg — its own
     Langfuse trace, no chat-cap re-check (the turn already passed it)."""
     config = _run_config(member, settings)
-    if await _pending_card(graph, config) is None:
+    if await pending_card(graph, config) is None:
         yield sse("error", {"code": "nothing_to_resume", "message": "No pending confirmation."})
         return
 
@@ -142,7 +142,14 @@ async def history(graph, member: AuthedMember, settings: Settings) -> list[dict]
         if isinstance(message, HumanMessage):
             out.append({"id": message.id, "role": "user", "content": message.content})
         elif isinstance(message, AIMessage) and message.content and not message.tool_calls:
-            out.append({"id": message.id, "role": "assistant", "content": message.content})
+            entry = {"id": message.id, "role": "assistant", "content": message.content}
+            # A proactive Insight (P7-S2) is tagged in `additional_kwargs` by
+            # `graph.py`'s `agent_node`; sparse and optional, same pattern as
+            # P7-S1's `edits` — an ordinary reply carries neither key.
+            if message.additional_kwargs.get("kind") == "insight":
+                entry["kind"] = "insight"
+                entry["posted_at"] = message.additional_kwargs.get("posted_at")
+            out.append(entry)
     return out
 
 
@@ -210,7 +217,7 @@ async def _drive(
         yield sse("error", {"code": "internal", "message": "The assistant hit an error."})
         return
 
-    card = await _pending_card(graph, config)
+    card = await pending_card(graph, config)
     if card is not None:
         trace.finish(output="[needs confirmation]")
         yield sse("needs_confirmation", card)
@@ -261,7 +268,7 @@ async def _latest_ai_id(graph, config) -> str | None:
     return None
 
 
-async def _pending_card(graph, config) -> dict | None:
+async def pending_card(graph, config) -> dict | None:
     """The confirm-card payload if the graph is paused on an `interrupt`."""
     state = await graph.aget_state(config)
     for task in state.tasks:
@@ -270,11 +277,11 @@ async def _pending_card(graph, config) -> dict | None:
     return None
 
 
-async def _discard_pending(graph, config) -> bool:
+async def discard_pending(graph, config) -> bool:
     """Throw away an unconfirmed proposal: drop the AI message whose write
     tool-calls opened the card, and re-route from `agent` so `state.next` clears.
     Returns whether there was one."""
-    if await _pending_card(graph, config) is None:
+    if await pending_card(graph, config) is None:
         return False
     state = await graph.aget_state(config)
     messages = (state.values or {}).get("messages", [])

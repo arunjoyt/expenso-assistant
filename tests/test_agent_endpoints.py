@@ -10,6 +10,7 @@ import pytest
 import respx
 from langgraph.checkpoint.memory import InMemorySaver
 
+from expenso_assistant import tools
 from expenso_assistant.agent.graph import build_graph
 from expenso_assistant.config import get_settings
 
@@ -165,3 +166,51 @@ async def test_clear_chat_empties_the_thread(client):
 
     assert cleared.json() == {"status": "cleared"}
     assert after.json()["messages"] == []
+
+
+# --- /run/proactive (P7-S2) ------------------------------------------------
+
+
+@pytest.fixture
+def proactive_app(spy_langfuse):
+    spy_langfuse()
+    checkpointer = InMemorySaver()
+    graph = build_graph(ScriptedChatModel(responses=[]), checkpointer=checkpointer)
+    read_only_graph = build_graph(
+        ScriptedChatModel(responses=[answer("Here is your insight.")]),
+        checkpointer=checkpointer,
+        tools=tools.READ_TOOLS,
+    )
+    from expenso_assistant.api.main import create_app
+
+    return create_app(graph=graph, checkpointer=checkpointer, read_only_graph=read_only_graph)
+
+
+@pytest.fixture
+def proactive_client(proactive_app):
+    return httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=proactive_app), base_url="http://test"
+    )
+
+
+async def test_run_proactive_returns_202_and_the_insight_lands_in_history(proactive_client):
+    async with proactive_client, respx.mock:
+        _wire_frappe()
+        head = {"Authorization": "Bearer tok-a"}
+        response = await proactive_client.post(
+            "/run/proactive", json={"job": "monthly_summary"}, headers=head
+        )
+        history = await proactive_client.get("/history", headers=head)
+
+    assert response.status_code == 202
+    assert response.json() == {"status": "accepted"}
+    messages = history.json()["messages"]
+    assert len(messages) == 1
+    assert messages[0]["kind"] == "insight"
+    assert messages[0]["content"] == "Here is your insight."
+
+
+async def test_run_proactive_requires_a_valid_bearer(proactive_client):
+    async with proactive_client:
+        response = await proactive_client.post("/run/proactive", json={"job": "monthly_summary"})
+    assert response.status_code == 401

@@ -14,7 +14,7 @@ read-only calls still go to `tools`. Proactive runs pass `tools=READ_TOOLS`, so
 from __future__ import annotations
 
 from collections.abc import Callable, Sequence
-from datetime import date
+from datetime import UTC, date, datetime
 from typing import Annotated, Any, TypedDict
 
 from langchain_core.language_models import BaseChatModel
@@ -68,15 +68,31 @@ def build_graph(
     model_with_tools = model.bind_tools(lc_tools)
     tool_node = ToolNode(lc_tools)
     max_tool_calls = get_settings().run_max_tool_calls
+    # No write tool in `fns` means this is a proactive run (P7-S2) — used to pick
+    # the system prompt's tone, not a re-check of what's bound (route() already
+    # enforces that structurally).
+    read_only = not any(fn.__name__ in tool_defs.WRITE_TOOL_NAMES for fn in fns)
 
     async def agent_node(state: AgentState, config) -> dict:
         if state.get("tool_call_count", 0) >= max_tool_calls:
             raise ToolCapExceeded(f"more than {max_tool_calls} tool calls in one turn")
         today = date.fromisoformat(config["configurable"]["today"])
-        prompt = SystemMessage(render_system_prompt(today))
-        image = (config.get("configurable") or {}).get("receipt_image")
-        messages = _with_receipt_image(state["messages"], image)
+        configurable = config.get("configurable") or {}
+        instruction = configurable.get("proactive_instruction")
+        prompt = SystemMessage(render_system_prompt(today, proactive=read_only))
+        messages = _with_receipt_image(state["messages"], configurable.get("receipt_image"))
+        messages = _with_proactive_instruction(messages, instruction)
         reply = await model_with_tools.ainvoke([prompt, *messages], config)
+        if instruction:
+            # Tags this run's reply(ies) as an Insight for the transcript
+            # (P7-S2) — every reply in a proactive turn gets it, including an
+            # intermediate tool-call message, but `history()` only surfaces the
+            # final content-only one, so that's harmless.
+            reply.additional_kwargs = {
+                **reply.additional_kwargs,
+                "kind": "insight",
+                "posted_at": datetime.now(UTC).isoformat(),
+            }
         return {"messages": [reply]}
 
     async def tools_node(state: AgentState, config) -> dict:
@@ -125,3 +141,16 @@ def _with_receipt_image(messages: list[AnyMessage], image: str | None) -> list[A
             )
             return [*messages[:i], multimodal, *messages[i + 1 :]]
     return messages
+
+
+def _with_proactive_instruction(
+    messages: list[AnyMessage], instruction: str | None
+) -> list[AnyMessage]:
+    """An ephemeral trailing instruction for a proactive run (P7-S2), riding in
+    `config` exactly like the receipt image above — never returned from
+    `agent_node`, so it is never checkpointed. The job description (which
+    Categories crossed budget, which month to summarize) is decided in
+    `agent/proactive.py`, not by the model."""
+    if not instruction:
+        return messages
+    return [*messages, HumanMessage(instruction)]

@@ -3,13 +3,18 @@
 Today's date is filled in per run (P6-S5 grill Q14) so the model can turn
 "March" into a concrete month and year; the run endpoint passes the
 service-timezone date. P6-S7 adds the write tools and the confirm-card rules.
+
+`proactive=True` (P7-S2) swaps the write-capabilities/confirm-card section for
+a short note about writing an unprompted check-in — a proactive run binds
+`READ_TOOLS` only (`graph.py`), so telling it about tools it doesn't have would
+just be misleading.
 """
 
 from __future__ import annotations
 
 from datetime import date
 
-_TEMPLATE = """You are Expenso's assistant. Expenso is a shared family finance tracker \
+_INTRO = """You are Expenso's assistant. Expenso is a shared family finance tracker \
 where the members of one household record their expenses and income together.
 
 Today is {today}, a {weekday}. When the user names a month with no year, take the \
@@ -19,7 +24,9 @@ Read the family's ledger with these tools, each taking a calendar month (1-12) \
 and a four-digit year: get_expenses, get_income, get_analytics, get_budgets, \
 list_categories, list_sources. get_analytics returns the month's totals, the \
 per-category spend and the budget status in one call — reach for it first on \
-"how am I doing" questions.
+"how am I doing" questions."""
+
+_WRITE_SECTION = """
 
 You can also change the ledger: create_expense, update_expense, delete_expense, \
 create_income, update_income, delete_income, add_category, add_source, set_budget. \
@@ -42,11 +49,21 @@ found — never ask "should I add this?", propose concrete values and let the co
 be the check. Check list_categories first and only pass a category that matches; leave it \
 unset rather than invent one. If a field is not legible or not on the receipt, leave it \
 unset rather than guess. If the photo is not a receipt, say so and ask what the member \
-wants — do not propose a create_expense.
+wants — do not propose a create_expense."""
+
+_PROACTIVE_SECTION = """
+
+You are writing a proactive check-in on your own, prompted by a schedule rather than \
+a member's question — there is no one present to ask for clarification, so read what \
+you need and state your best reading of the data plainly. Keep it to a few short \
+sentences of plain prose, no greeting."""
+
+_TAIL = """
 
 Answer in plain, concise prose. Report amounts as plain numbers with no currency \
 symbol. If a tool comes back empty, say so plainly instead of guessing."""
 
 
-def render_system_prompt(today: date) -> str:
-    return _TEMPLATE.format(today=today.isoformat(), weekday=today.strftime("%A"))
+def render_system_prompt(today: date, *, proactive: bool = False) -> str:
+    body = _INTRO + (_PROACTIVE_SECTION if proactive else _WRITE_SECTION) + _TAIL
+    return body.format(today=today.isoformat(), weekday=today.strftime("%A"))
