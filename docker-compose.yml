@@ -23,6 +23,12 @@ services:
     environment:
       DATABASE_URL: postgresql://postgres:${POSTGRES_PASSWORD:-postgres}@postgres:5432/assistant
       LANGFUSE_HOST: http://langfuse:3000
+      # Derived from ASSISTANT_HOSTNAME (the single source of truth, also used
+      # bare by nginx's Traefik router label below) rather than kept as its
+      # own .env entry — Compose can concatenate a scheme onto a hostname but
+      # can't strip one back off, so the bare-hostname form has to be the one
+      # actually stored.
+      PUBLIC_BASE_URL: https://${ASSISTANT_HOSTNAME:-localhost:8080}
     depends_on:
       postgres:
         condition: service_healthy
