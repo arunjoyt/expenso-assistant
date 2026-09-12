@@ -1,8 +1,19 @@
 # expenso-assistant stack — co-located on the Frappe VPS (ADR 0008, DEPLOYMENT.md).
 # One app process (FastAPI + agent + optional FastMCP adapter), one Postgres
-# shared by the LangGraph checkpointer and Langfuse, Langfuse v2, and nginx for
-# TLS on the public app endpoint. The Langfuse UI is never exposed — loopback
-# only, browsed over an SSH tunnel.
+# shared by the LangGraph checkpointer and Langfuse, Langfuse v2, and nginx as
+# an internal SSE-aware proxy in front of `app`. The Frappe bench's own Traefik
+# (frappe_docker's overrides/compose.https.yaml) already owns host ports 80/443
+# for the 3 existing sites, so nginx here does NOT publish host ports — it
+# joins `frappe-bench_default` (the frappe-bench compose project's own
+# default network, confirmed live 2026-09-12) and Traefik, which already sits
+# on that network, terminates TLS for assistant.<site> and routes to it
+# directly — no changes needed on the VPS/frappe_docker side. Confirmed live
+# config: certresolver is `main-resolver` (not the stock `le`), and the
+# HTTP->HTTPS redirect is global on Traefik's `web` entrypoint, so only one
+# router (on `websecure`) is needed per site. See vps-ref-contabo's
+# RUNBOOK.md ("Fronting expenso-assistant through the existing Traefik").
+# The Langfuse UI is never exposed — loopback only, browsed over an SSH
+# tunnel.
 
 services:
   app:
@@ -61,12 +72,30 @@ services:
     restart: unless-stopped
     depends_on:
       - app
-    ports:
-      - "443:443"
-      - "80:80"
+    # No host ports — joins the frappe-bench project's own default network,
+    # which Traefik (its `proxy` service) already sits on, so Traefik routes
+    # to this container directly. See docker-compose.yml header comment +
+    # vps-ref-contabo RUNBOOK.md.
+    networks:
+      - default
+      - frappe-bench_default
     volumes:
       - ./nginx/nginx.conf:/etc/nginx/conf.d/default.conf:ro
-      - ./nginx/certs:/etc/nginx/certs:ro
+    labels:
+      - traefik.enable=true
+      - traefik.docker.network=frappe-bench_default
+      # Single router: the web->websecure redirect is global on Traefik's
+      # entrypoint (confirmed live 2026-09-12), no separate -http router needed.
+      - traefik.http.routers.assistant.rule=Host(`${ASSISTANT_HOSTNAME:-assistant.example.com}`)
+      - traefik.http.routers.assistant.entrypoints=websecure
+      - traefik.http.routers.assistant.tls.certresolver=main-resolver
+      - traefik.http.routers.assistant.service=assistant
+      - traefik.http.services.assistant.loadbalancer.server.port=80
+
+networks:
+  default: {}
+  frappe-bench_default:
+    external: true
 
 volumes:
   pgdata:
