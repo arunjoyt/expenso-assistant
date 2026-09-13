@@ -32,7 +32,13 @@ async def test_one_trace_per_turn_tagged_for_the_member(member, spy):
     assert trace.updates[-1]["output"].strip() == "Hi."
 
 
-async def test_generation_cost_is_the_services_number(member, spy):
+async def test_generation_usage_sent_to_langfuse_as_real_tokens(member, spy):
+    # expenso-assistant#4: this self-hosted Langfuse build silently drops the
+    # usage_details/cost_details shape at ingestion (confirmed via live
+    # debugging — 201, no error, but never persisted). Only the deprecated
+    # `usage` shape actually reaches the UI, so that's what we send; cost
+    # itself is no longer forwarded to Langfuse at all (see the module
+    # docstring) — cost_for()'s own math is covered by test_config.py.
     model = ScriptedChatModel(responses=[answer("Hi.", inp=1_000_000, out=1_000_000)])
     graph = build_graph(model, checkpointer=InMemorySaver())
 
@@ -40,21 +46,13 @@ async def test_generation_cost_is_the_services_number(member, spy):
 
     generations = spy.traces[0].generations
     assert len(generations) == 1
-    # 1M uncached input + 1M output on gpt-4o-mini = 0.15 + 0.60
-    assert round(generations[0]["cost_details"]["total"], 6) == 0.75
-    assert generations[0]["usage_details"]["input"] == 1_000_000
-
-
-async def test_generation_cost_discounts_cache_and_bills_reasoning_as_output(member, spy):
-    model = ScriptedChatModel(
-        responses=[answer("Hi.", inp=1_000_000, cached=1_000_000, out=0, reasoning=1_000_000)]
-    )
-    graph = build_graph(model, checkpointer=InMemorySaver())
-
-    await run_turn(graph, member, "hello")
-
-    # all input cached (0.075) + reasoning as output (0.60)
-    assert round(spy.traces[0].generations[0]["cost_details"]["total"], 6) == 0.675
+    assert generations[0]["usage"] == {
+        "promptTokens": 1_000_000,
+        "completionTokens": 1_000_000,
+        "totalTokens": 2_000_000,
+    }
+    assert "usage_details" not in generations[0]
+    assert "cost_details" not in generations[0]
 
 
 async def test_daily_cap_checked_before_this_runs_own_trace_opens(member, spy, spy_token_store):
@@ -91,11 +89,10 @@ async def test_tool_call_only_generation_with_no_usage_logs_a_warning(member, sp
 
     assert events[-1][0] == "needs_confirmation"
     generation = spy.traces[0].generations[0]
-    assert generation["usage_details"] == {
-        "input": 0,
-        "output": 0,
-        "cache_read_input_tokens": 0,
+    assert generation["usage"] == {
+        "promptTokens": 0,
+        "completionTokens": 0,
+        "totalTokens": 0,
     }
-    assert generation["cost_details"]["total"] == 0.0
-    [record] = [r for r in caplog.records if "no usage metadata" in r.message]
+    [record] = [r for r in caplog.records if "zero usage on LLM response" in r.message]
     assert "tool_calls=True" in record.message

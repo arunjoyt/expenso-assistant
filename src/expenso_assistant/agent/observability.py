@@ -1,12 +1,27 @@
-"""Langfuse tracing, the explicit-cost callback, and the daily token cap.
+"""Langfuse tracing, the token/cost callback, and the daily token cap.
 
 ADR 0008: Langfuse is the *only* record of an LLM call. Every turn opens one
 trace tagged `user_id` / `metadata.feature` / `session_id` (no `family` — see the
-2026-09-10 P6-S5 update), and the generation carries a cost this service
-computes from `config.MODEL_PRICING` — never Langfuse's own model-price table.
+2026-09-10 P6-S5 update).
 
-The stock `langfuse.callback.CallbackHandler` is deliberately not used: it defers
-cost to Langfuse's catalog, and it drags in the full `langchain` meta-package.
+expenso-assistant#4 update (2026-09-13): ADR 0008 originally had this service
+compute cost from `config.MODEL_PRICING` and send it to Langfuse via
+`usage_details`/`cost_details`, deliberately never Langfuse's own model-price
+table. Live debugging proved that plan doesn't work on this self-hosted build
+(`langfuse/langfuse:2`, resolves to 2.95.11): the ingestion API accepts
+`usage_details`/`cost_details` (`201`, no error) but silently never persists
+them — generations showed `$0.00`/no tokens in the UI even though our code
+computed real numbers. Only the deprecated `usage` shape
+(`promptTokens`/`completionTokens`/`totalTokens`) actually reaches the UI, and
+once it does, Langfuse always prices it from its own catalog — our cost is not
+recoverable there. So `CostCallback` now sends real token counts via `usage`
+for a correct token badge, and no longer sends cost to Langfuse at all;
+`cost_for`/`MODEL_PRICING` (config.py) stay as this service's own tested cost
+math, just not forwarded anywhere. The daily cap was never affected by any of
+this — see `within_daily_token_cap` below.
+
+The stock `langfuse.callback.CallbackHandler` is deliberately not used: it drags
+in the full `langchain` meta-package.
 
 The daily cap (`within_daily_token_cap`) is the one exception to "Langfuse is
 the only record": it reads a same-day token total from a small Postgres
@@ -192,18 +207,20 @@ class CostCallback(BaseCallbackHandler):
 
     def on_llm_end(self, response: LLMResult, **_: Any) -> None:
         usage = _usage_from_result(response)
-        cost = cost_for(self._model, **usage) or 0.0
-        self.total_cost += cost
+        self.total_cost += cost_for(self._model, **usage) or 0.0
         self._trace.generation(
             name="chat-completion",
             model=self._model,
             output=_text_from_result(response),
-            usage_details={
-                "input": usage["input_tokens"],
-                "output": usage["output_tokens"],
-                "cache_read_input_tokens": usage["cached_tokens"],
+            # Legacy shape, not usage_details/cost_details — see the module
+            # docstring (expenso-assistant#4). Langfuse prices this from its
+            # own catalog; this service's own cost_for() result above is kept
+            # for local bookkeeping only, not sent here.
+            usage={
+                "promptTokens": usage["input_tokens"],
+                "completionTokens": usage["output_tokens"],
+                "totalTokens": usage["input_tokens"] + usage["output_tokens"],
             },
-            cost_details={"total": cost},
         )
         # Best-effort bookkeeping, unlike the gate in `within_daily_token_cap`:
         # the call already happened and the cost is already incurred, so a
@@ -221,34 +238,44 @@ def _usage_from_result(response: LLMResult) -> dict[str, int]:
     generation = response.generations[0][0]
     message = getattr(generation, "message", None)
     meta = getattr(message, "usage_metadata", None) or {}
-    if meta:
-        return {
-            "input_tokens": meta.get("input_tokens", 0),
-            "output_tokens": meta.get("output_tokens", 0),
-            "cached_tokens": (meta.get("input_token_details") or {}).get("cache_read", 0),
-            "reasoning_tokens": (meta.get("output_token_details") or {}).get("reasoning", 0),
-        }
     token_usage = (response.llm_output or {}).get("token_usage", {})
-    if not token_usage:
+
+    usage = {
+        "input_tokens": meta.get("input_tokens", 0),
+        "output_tokens": meta.get("output_tokens", 0),
+        "cached_tokens": (meta.get("input_token_details") or {}).get("cache_read", 0),
+        "reasoning_tokens": (meta.get("output_token_details") or {}).get("reasoning", 0),
+    }
+    if not usage["input_tokens"] and not usage["output_tokens"]:
+        usage = {
+            "input_tokens": token_usage.get("prompt_tokens", 0),
+            "output_tokens": token_usage.get("completion_tokens", 0),
+            "cached_tokens": (token_usage.get("prompt_tokens_details") or {}).get(
+                "cached_tokens", 0
+            ),
+            "reasoning_tokens": (token_usage.get("completion_tokens_details") or {}).get(
+                "reasoning_tokens", 0
+            ),
+        }
+    if not usage["input_tokens"] and not usage["output_tokens"]:
         # expenso-assistant#4: a live trace comparison found $0.00/empty usage on
-        # generations that end in a tool call with no final text — unconfirmed
-        # whether that's the actual trigger. Logged here (not raised) so a live
-        # recurrence tells us, from `tool_calls`/`finish_reason`, whether that
-        # hypothesis holds, without guessing further from static reading alone.
+        # generations that end in a tool call with no final text. The original
+        # version of this warning only fired when `usage_metadata` was entirely
+        # absent — a live recurrence showed it comes back as a non-empty dict
+        # with all fields zeroed instead, which skipped that check silently.
+        # Logging both raw sources now (not just the zeroed one) to see which
+        # side, if either, actually carries real numbers.
         logger.warning(
-            "no usage metadata on LLM response (tool_calls=%s, finish_reason=%s, content=%r)",
+            "zero usage on LLM response (tool_calls=%s, finish_reason=%s, content=%r, "
+            "usage_metadata=%r, token_usage=%r, response_metadata=%r)",
             bool(getattr(message, "tool_calls", None)),
             (getattr(message, "response_metadata", None) or {}).get("finish_reason"),
             getattr(message, "content", None),
+            meta,
+            token_usage,
+            getattr(message, "response_metadata", None),
         )
-    return {
-        "input_tokens": token_usage.get("prompt_tokens", 0),
-        "output_tokens": token_usage.get("completion_tokens", 0),
-        "cached_tokens": (token_usage.get("prompt_tokens_details") or {}).get("cached_tokens", 0),
-        "reasoning_tokens": (token_usage.get("completion_tokens_details") or {}).get(
-            "reasoning_tokens", 0
-        ),
-    }
+    return usage
 
 
 def _text_from_result(response: LLMResult) -> str:
