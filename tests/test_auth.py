@@ -30,6 +30,13 @@ def test_oauth_proxy_built_when_configured(monkeypatch):
     # that made FastMCP apply RFC 8414's path-suffix convention to its own
     # discovery-document address, a different 404.)
     assert str(provider.base_url).rstrip("/") == settings.public_base_url.rstrip("/")
+    # Live prod bug: FastMCP's OAuthProxy defaults to "client_secret_basic"
+    # (an Authorization: Basic header) for the upstream token exchange, but
+    # Frappe's `get_token` only ever reads credentials from the POST body
+    # (see DEPLOYMENT.md's "prefer PKCE" caveat) — the basic header is
+    # silently ignored and the exchange fails, surfaced to a connecting
+    # client as an opaque "Authorization failed".
+    assert provider._token_endpoint_auth_method == "client_secret_post"
 
 
 @respx.mock

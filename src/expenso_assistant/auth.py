@@ -145,6 +145,14 @@ def build_auth_provider():
         upstream_token_endpoint=f"{frappe_url}{_TOKEN}",
         upstream_client_id=settings.frappe_oauth_client_id,
         upstream_client_secret=settings.frappe_oauth_client_secret,
+        # FastMCP defaults to "client_secret_basic" (an Authorization: Basic
+        # header) for the upstream token exchange. Frappe's `get_token` only
+        # ever reads client_id/client_secret from the POST body (frappe/
+        # oauth.py — see DEPLOYMENT.md's "prefer PKCE" caveat), so the basic
+        # header is silently ignored and the exchange fails auth — surfaced
+        # to a connecting client as an opaque "Authorization failed", found
+        # live testing the prod connector end-to-end.
+        token_endpoint_auth_method="client_secret_post",
         token_verifier=FrappeTokenVerifier(frappe_url=frappe_url),
         # FastMCP's own docstring: "the base URL of this server" — must match
         # wherever `/authorize`, `/token`, and `/.well-known/...` actually
