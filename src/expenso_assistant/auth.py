@@ -146,14 +146,16 @@ def build_auth_provider():
         upstream_client_id=settings.frappe_oauth_client_id,
         upstream_client_secret=settings.frappe_oauth_client_secret,
         token_verifier=FrappeTokenVerifier(frappe_url=frappe_url),
-        # FastMCP's own docstring: "the base URL of this server" — i.e. where
-        # `/authorize`, `/token`, and `/.well-known/...` actually resolve, not
-        # just the service's public root. `main.py` mounts the MCP app under
-        # `/mcp` (`app.mount("/mcp", mcp_app)`), so every self-advertised URL
-        # (the discovery metadata's `authorization_endpoint`, and the `/mcp`
-        # 401's `WWW-Authenticate: resource_metadata=...`) must carry that
-        # prefix too, or a connecting client is sent to a 404 (found live in
-        # prod: the metadata said `{base_url}/authorize`, only
-        # `{base_url}/mcp/authorize` ever existed).
-        base_url=f"{settings.public_base_url.rstrip('/')}/mcp",
+        # FastMCP's own docstring: "the base URL of this server" — must match
+        # wherever `/authorize`, `/token`, and `/.well-known/...` actually
+        # resolve. main.py mounts the whole MCP app (protocol + OAuth routes)
+        # at the outer ASGI root, with only the *protocol* endpoint pushed
+        # down to `/mcp` internally (`http_app(path="/mcp")`) — so the OAuth
+        # routes sit at the bare public root, matching `public_base_url`
+        # as-is. (A prior attempt appended "/mcp" here instead of fixing the
+        # mount; that made FastMCP apply RFC 8414's path-suffix convention to
+        # its *own* advertised discovery-document address — e.g.
+        # `/.well-known/oauth-authorization-server/mcp` — which FastMCP
+        # doesn't actually serve at that suffixed path, a second 404.)
+        base_url=settings.public_base_url,
     )

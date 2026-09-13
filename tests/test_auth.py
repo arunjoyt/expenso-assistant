@@ -18,13 +18,18 @@ def test_oauth_proxy_built_when_configured(monkeypatch):
     from expenso_assistant.config import get_settings
 
     get_settings.cache_clear()
+    settings = get_settings()
     provider = build_auth_provider()
     assert provider is not None
     assert type(provider).__name__ == "OAuthProxy"
-    # Live prod bug: the MCP app is mounted at `/mcp` (main.py), so every
-    # self-advertised OAuth URL (discovery metadata, WWW-Authenticate) must
-    # carry that prefix or a connecting client is sent to a 404 `/authorize`.
-    assert str(provider.base_url).rstrip("/").endswith("/mcp")
+    # Live prod bug: base_url must match where the OAuth routes actually
+    # resolve. main.py mounts the whole MCP app (protocol + OAuth routes) at
+    # the ASGI root, with only the protocol endpoint pushed to `/mcp`
+    # internally — so base_url is the bare public root, not `.../mcp`. (A
+    # prior fix attempt appended "/mcp" here instead of fixing the mount;
+    # that made FastMCP apply RFC 8414's path-suffix convention to its own
+    # discovery-document address, a different 404.)
+    assert str(provider.base_url).rstrip("/") == settings.public_base_url.rstrip("/")
 
 
 @respx.mock

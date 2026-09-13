@@ -58,7 +58,17 @@ def create_app(*, graph=None, checkpointer=None, read_only_graph=None) -> FastAP
     if settings.mcp_enabled:
         from ..mcp_server import build_mcp_server
 
-        mcp_app = build_mcp_server().http_app(path="/")
+        # `path="/mcp"` puts the streamable-HTTP protocol endpoint at `/mcp`
+        # *inside* this sub-app; mounted at the outer root below, that lands
+        # it at the top-level `/mcp` we want. Crucially, FastMCP's OAuth
+        # routes (`/authorize`, `/token`, `/.well-known/...`) live at this
+        # sub-app's own root regardless of `path=` — nesting the whole app
+        # under an *additional* `/mcp` prefix (the old `app.mount("/mcp", ...)`
+        # below) put those at `/mcp/authorize` etc., while `base_url` (auth.py)
+        # necessarily advertises them at the bare public root: a client
+        # following the discovered `authorization_endpoint` 404'd. Mounting at
+        # `/` instead makes the real routes match what's advertised.
+        mcp_app = build_mcp_server().http_app(path="/mcp")
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -148,7 +158,10 @@ def create_app(*, graph=None, checkpointer=None, read_only_graph=None) -> FastAP
         return {"status": "accepted"}
 
     if mcp_app is not None:
-        app.mount("/mcp", mcp_app)
+        # Mounted last, after every explicit route above, so this only
+        # catches what they don't — the MCP protocol at `/mcp` (per `path=`
+        # above) and FastMCP's own OAuth routes at their unprefixed paths.
+        app.mount("/", mcp_app)
 
     return app
 

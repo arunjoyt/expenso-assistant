@@ -34,6 +34,29 @@ def test_mcp_not_mounted_when_disabled(monkeypatch):
     assert not any(p.startswith("/mcp") for p in paths)
 
 
+def test_mcp_app_mounted_at_root_with_protocol_endpoint_at_mcp(monkeypatch):
+    """Live prod bug: FastMCP's OAuth routes (`/authorize`, `/token`,
+    `/.well-known/...`) live at the mounted sub-app's own root, not under
+    whatever prefix it's mounted at — but the discovery metadata always
+    advertises them at `public_base_url` (bare). Nesting the whole MCP app
+    under an *extra* `/mcp` prefix (`app.mount("/mcp", ...)`) put the real
+    routes at `/mcp/authorize` while the metadata still said `/authorize`,
+    404ing every connector. The MCP app must mount at the ASGI root, with
+    only the streamable-HTTP protocol endpoint itself pushed to `/mcp`."""
+    from starlette.routing import Mount
+
+    from expenso_assistant.config import get_settings
+
+    get_settings.cache_clear()
+    from expenso_assistant.api.main import create_app
+
+    app = create_app()
+    mounts = [r for r in app.routes if isinstance(r, Mount)]
+    (mcp_mount,) = [m for m in mounts if m.path == ""]
+    sub_paths = {str(getattr(r, "path", "")) for r in mcp_mount.app.routes}
+    assert "/mcp" in sub_paths
+
+
 @respx.mock
 async def test_write_tool_confirms_then_writes_with_connector_provenance():
     route = respx.post(method_url(f"{API}.create_expense")).mock(
