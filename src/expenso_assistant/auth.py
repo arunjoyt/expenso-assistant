@@ -146,5 +146,14 @@ def build_auth_provider():
         upstream_client_id=settings.frappe_oauth_client_id,
         upstream_client_secret=settings.frappe_oauth_client_secret,
         token_verifier=FrappeTokenVerifier(frappe_url=frappe_url),
-        base_url=settings.public_base_url,
+        # FastMCP's own docstring: "the base URL of this server" — i.e. where
+        # `/authorize`, `/token`, and `/.well-known/...` actually resolve, not
+        # just the service's public root. `main.py` mounts the MCP app under
+        # `/mcp` (`app.mount("/mcp", mcp_app)`), so every self-advertised URL
+        # (the discovery metadata's `authorization_endpoint`, and the `/mcp`
+        # 401's `WWW-Authenticate: resource_metadata=...`) must carry that
+        # prefix too, or a connecting client is sent to a 404 (found live in
+        # prod: the metadata said `{base_url}/authorize`, only
+        # `{base_url}/mcp/authorize` ever existed).
+        base_url=f"{settings.public_base_url.rstrip('/')}/mcp",
     )

@@ -21,6 +21,10 @@ def test_oauth_proxy_built_when_configured(monkeypatch):
     provider = build_auth_provider()
     assert provider is not None
     assert type(provider).__name__ == "OAuthProxy"
+    # Live prod bug: the MCP app is mounted at `/mcp` (main.py), so every
+    # self-advertised OAuth URL (discovery metadata, WWW-Authenticate) must
+    # carry that prefix or a connecting client is sent to a 404 `/authorize`.
+    assert str(provider.base_url).rstrip("/").endswith("/mcp")
 
 
 @respx.mock
