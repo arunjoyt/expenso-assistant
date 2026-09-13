@@ -9,7 +9,7 @@ from expenso_assistant.agent.graph import build_graph
 from expenso_assistant.config import get_settings
 
 from .fakes import ScriptedChatModel
-from .test_agent_session import answer, run_turn
+from .test_agent_session import answer, run_turn, tool_call
 
 
 @pytest.fixture
@@ -76,3 +76,26 @@ async def test_generation_tokens_are_recorded_against_the_daily_total(member, sp
 
     assert spy.added == [(member.email, 1_050)]
     assert spy.get(member.email, None) == 1_050
+
+
+async def test_tool_call_only_generation_with_no_usage_logs_a_warning(member, spy, caplog):
+    # expenso-assistant#4: a live trace comparison found $0.00/empty usage on
+    # generations ending in a tool call with no final text. This is today's
+    # actual (buggy) behavior for a response with no usage_metadata at all —
+    # pinned down here so a fix changes this test, not just prod traces.
+    model = ScriptedChatModel(responses=[tool_call("create_expense", amount=5)])
+    graph = build_graph(model, checkpointer=InMemorySaver())
+
+    with caplog.at_level("WARNING", logger="expenso_assistant.agent.observability"):
+        events = await run_turn(graph, member, "add a coffee expense of 5")
+
+    assert events[-1][0] == "needs_confirmation"
+    generation = spy.traces[0].generations[0]
+    assert generation["usage_details"] == {
+        "input": 0,
+        "output": 0,
+        "cache_read_input_tokens": 0,
+    }
+    assert generation["cost_details"]["total"] == 0.0
+    [record] = [r for r in caplog.records if "no usage metadata" in r.message]
+    assert "tool_calls=True" in record.message

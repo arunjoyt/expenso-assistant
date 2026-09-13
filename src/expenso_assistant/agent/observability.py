@@ -229,6 +229,18 @@ def _usage_from_result(response: LLMResult) -> dict[str, int]:
             "reasoning_tokens": (meta.get("output_token_details") or {}).get("reasoning", 0),
         }
     token_usage = (response.llm_output or {}).get("token_usage", {})
+    if not token_usage:
+        # expenso-assistant#4: a live trace comparison found $0.00/empty usage on
+        # generations that end in a tool call with no final text — unconfirmed
+        # whether that's the actual trigger. Logged here (not raised) so a live
+        # recurrence tells us, from `tool_calls`/`finish_reason`, whether that
+        # hypothesis holds, without guessing further from static reading alone.
+        logger.warning(
+            "no usage metadata on LLM response (tool_calls=%s, finish_reason=%s, content=%r)",
+            bool(getattr(message, "tool_calls", None)),
+            (getattr(message, "response_metadata", None) or {}).get("finish_reason"),
+            getattr(message, "content", None),
+        )
     return {
         "input_tokens": token_usage.get("prompt_tokens", 0),
         "output_tokens": token_usage.get("completion_tokens", 0),
