@@ -10,7 +10,7 @@ import json
 import httpx
 import pytest
 import respx
-from langchain_core.messages import AIMessage
+from langchain_core.messages import AIMessage, ToolMessage
 from langgraph.checkpoint.memory import InMemorySaver
 
 from expenso_assistant.agent import session
@@ -249,6 +249,42 @@ async def test_a_per_action_conflict_does_not_abort_the_batch(member):
     assert update.call_count == 2  # both attempted
     assert events[-1][0] == "done"
     assert "changed since you read it" in model.last_prompt[-1].content.lower()
+
+
+@respx.mock
+async def test_partial_confirm_tool_messages_are_row_specific(member):
+    coffee = {**EXPENSE_ROW, "name": "EXP-17", "amount": 5, "category_name": "Dining"}
+    carrot = {**EXPENSE_ROW, "name": "EXP-18", "amount": 10, "category_name": "Groceries"}
+    _stub_get_expenses([coffee, carrot])
+    respx.post(method_url(f"{API}.update_expense")).mock(
+        return_value=httpx.Response(200, json={"message": {"name": "EXP-18"}})
+    )
+    model = ScriptedChatModel(
+        responses=[
+            tool_call("get_expenses", month=3, year=2026),
+            multi_call(
+                ("update_expense", {"name": "EXP-17", "category": "Other"}),
+                ("update_expense", {"name": "EXP-18", "category": "Other"}),
+            ),
+            answer("Done."),
+        ]
+    )
+    graph = build_graph(model, checkpointer=InMemorySaver())
+    await run_turn(graph, member, "recategorize the coffee and carrot expenses to Other")
+
+    # Confirm only the carrot row (w1); skip the coffee row (w0).
+    await _resume(graph, member, {"selected": ["w1"]})
+
+    tool_messages = {
+        m.tool_call_id: m.content for m in model.last_prompt if isinstance(m, ToolMessage)
+    }
+    # expenso-assistant#5: each outcome must name its own row (Dining vs.
+    # Groceries) so the model isn't left to guess which is which from
+    # tool_call_id matching alone when it narrates the batch back.
+    assert "skipped" in tool_messages["w0"].lower()
+    assert "dining" in tool_messages["w0"].lower()
+    assert "updated" in tool_messages["w1"].lower()
+    assert "groceries" in tool_messages["w1"].lower()
 
 
 @respx.mock

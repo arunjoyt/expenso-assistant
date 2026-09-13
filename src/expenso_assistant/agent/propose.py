@@ -83,7 +83,8 @@ async def propose_node(state: dict, config) -> dict:
         out.append(
             _tool_msg(
                 {"id": a["id"], "name": a["tool"]},
-                f"Deferred — over the {cap}-changes-per-card limit. Propose this one again next.",
+                f"{a['summary']}: deferred — over the {cap}-changes-per-card limit. "
+                "Propose this one again next.",
             )
         )
     return {"messages": out, **bump}
@@ -182,7 +183,7 @@ def _public(action: dict) -> dict:
 async def _apply(action: dict, approved: bool, edits: dict | None, trace: Any) -> ToolMessage:
     ref = {"id": action["id"], "name": action["tool"]}
     if not approved:
-        return _tool_msg(ref, "Skipped by the member.")
+        return _tool_msg(ref, f"{action['summary']}: skipped by the member.")
 
     call_args = dict(action["call_args"])
     if edits:
@@ -200,7 +201,7 @@ async def _apply(action: dict, approved: bool, edits: dict | None, trace: Any) -
                 f"{action['summary']} changed since you read it — re-read and re-propose "
                 "if the change is still wanted.",
             )
-        return _tool_msg(ref, f"Could not apply: {exc.detail}")
+        return _tool_msg(ref, f"{action['summary']}: could not apply — {exc.detail}")
     finally:
         tool_defs.reset_entry_method(entry_token)
 
@@ -232,11 +233,15 @@ def _score_receipt_accuracy(action: dict, call_args: dict, trace: Any) -> None:
 
 
 def _applied_text(action: dict, result: Any) -> str:
+    # Leads with `action["summary"]` — the same row description the Member
+    # saw on the confirm card — so the model has an unambiguous anchor per
+    # row when narrating a batch back, rather than having to infer which
+    # outcome belongs to which item from tool_call_id matching alone
+    # (expenso-assistant#5: narration got two rows' outcomes backwards).
     verb = {"create": "Created", "update": "Updated", "delete": "Deleted"}[action["kind"]]
     name = (result or {}).get("name") if isinstance(result, dict) else None
-    return (
-        f"{verb} {action['entity']} {name}".strip() if name else f"{verb} the {action['entity']}."
-    )
+    ref = f" ({name})" if name else ""
+    return f"{action['summary']}: {verb} the {action['entity']}{ref}."
 
 
 # --- reading the tool history -------------------------------------------
