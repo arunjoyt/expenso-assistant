@@ -14,8 +14,22 @@ from ..config import Settings
 
 
 def build_model(settings: Settings) -> BaseChatModel:
+    return _chat_openai(settings, settings.openai_model)
+
+
+def build_fallback_model(settings: Settings) -> BaseChatModel | None:
+    """The stock `ModelFallbackMiddleware`'s model (ADR 0010), or None when
+    `OPENAI_FALLBACK_MODEL` is unset. Transient errors are already retried by
+    the OpenAI SDK itself (2 retries, honouring `Retry-After`), so there is no
+    separate model-retry middleware."""
+    if not settings.openai_fallback_model:
+        return None
+    return _chat_openai(settings, settings.openai_fallback_model)
+
+
+def _chat_openai(settings: Settings, model: str) -> BaseChatModel:
     return ChatOpenAI(
-        model=settings.openai_model,
+        model=model,
         api_key=settings.openai_api_key or "unset",
         temperature=0,
         streaming=True,

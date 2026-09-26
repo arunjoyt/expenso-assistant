@@ -4,56 +4,40 @@ from __future__ import annotations
 
 import ast
 import pathlib
+from datetime import date
 
-from langchain_core.messages import HumanMessage
+from langchain_core.messages import AIMessage, HumanMessage
 from langgraph.checkpoint.memory import InMemorySaver
 
 from expenso_assistant import tools
-from expenso_assistant.agent.graph import _token_counter, _windowed, bound_tool_names, build_graph
+from expenso_assistant.agent.graph import bound_tool_names, build_graph
+from expenso_assistant.agent.state import RunContext
 
 from .fakes import ScriptedChatModel
 
 _AGENT_DIR = pathlib.Path(__file__).parent.parent / "src" / "expenso_assistant" / "agent"
 
 
-def test_interactive_graph_binds_read_and_write_tools_directly():
-    model = ScriptedChatModel()
-    build_graph(model, checkpointer=InMemorySaver())
+async def test_interactive_graph_binds_read_and_write_tools_directly():
+    model = ScriptedChatModel(responses=[AIMessage("hi")])
+    await _one_model_call(build_graph(model, checkpointer=InMemorySaver()))
 
     all_names = {fn.__name__ for fn in tools.ALL_TOOLS}
     assert set(model.bound_tools) == all_names
     assert bound_tool_names() == all_names
 
 
-def test_read_only_graph_binds_no_write_tool():
-    """Proactive runs (P7-S2) pass tools=READ_TOOLS — no write tool is bound, so
-    route() can never reach the propose node there."""
-    model = ScriptedChatModel()
-    build_graph(model, checkpointer=InMemorySaver(), tools=tools.READ_TOOLS)
+async def test_read_only_graph_binds_no_write_tool():
+    """Proactive runs (P7-S2) pass tools=READ_TOOLS — no write tool is bound,
+    and the human-in-the-loop confirm step is left out of the graph."""
+    model = ScriptedChatModel(responses=[AIMessage("hi")])
+    graph = build_graph(model, checkpointer=InMemorySaver(), tools=tools.READ_TOOLS)
+    await _one_model_call(graph)
 
     write_names = {fn.__name__ for fn in tools.WRITE_TOOLS}
+    assert set(model.bound_tools) == {fn.__name__ for fn in tools.READ_TOOLS}
     assert not set(model.bound_tools) & write_names
-
-
-def test_windowed_keeps_only_the_most_recent_messages_under_budget():
-    """2026-09-11 update: a transient trim, not a checkpoint prune — this
-    tests the pure function, not the checkpoint (see test_agent_session.py
-    for proof the persisted thread is untouched)."""
-    count = _token_counter("gpt-4o-mini")
-    messages = [HumanMessage(f"message number {i} padded with extra words") for i in range(20)]
-
-    trimmed = _windowed(messages, count, budget=50)
-
-    assert trimmed[-1].content == messages[-1].content
-    assert messages[0].content not in [m.content for m in trimmed]
-    assert count(trimmed) <= 50
-
-
-def test_windowed_is_a_noop_under_budget():
-    messages = [HumanMessage("hi")]
-    count = _token_counter("gpt-4o-mini")
-
-    assert _windowed(messages, count, budget=10_000) == messages
+    assert not any("HumanInTheLoop" in node for node in graph.get_graph().nodes)
 
 
 def test_agent_package_imports_no_mcp():
@@ -69,3 +53,12 @@ def test_agent_package_imports_no_mcp():
             for name in names:
                 assert name != "mcp"
                 assert not name.startswith(("mcp.", "langchain_mcp", "fastmcp"))
+
+
+async def _one_model_call(graph) -> None:
+    """`create_agent` binds tools per model call, not at build time."""
+    await graph.ainvoke(
+        {"messages": [HumanMessage("hi")]},
+        {"configurable": {"thread_id": "t"}},
+        context=RunContext(today=date(2026, 3, 14)),
+    )

@@ -26,7 +26,7 @@ from .. import __version__
 from .. import tools as tool_defs
 from ..agent import proactive, session
 from ..agent.graph import build_graph
-from ..agent.model import build_model
+from ..agent.model import build_fallback_model, build_model
 from ..auth import AuthedMember, MemberDep
 from ..config import get_settings
 from ..frappe_client import aclose_http
@@ -81,12 +81,18 @@ def create_app(*, graph=None, checkpointer=None, read_only_graph=None) -> FastAP
             else:
                 app.state.checkpointer = await _build_checkpointer(stack, settings.database_url)
                 model = build_model(settings)
-                app.state.graph = build_graph(model, checkpointer=app.state.checkpointer)
+                fallback = build_fallback_model(settings)
+                app.state.graph = build_graph(
+                    model, checkpointer=app.state.checkpointer, fallback_model=fallback
+                )
                 # A separate compiled graph bound to READ_TOOLS only, sharing
                 # the same checkpointer/thread — proactive runs (P7-S2) can
                 # never produce a write tool-call, a binding-level guarantee.
                 app.state.read_only_graph = build_graph(
-                    model, checkpointer=app.state.checkpointer, tools=tool_defs.READ_TOOLS
+                    model,
+                    checkpointer=app.state.checkpointer,
+                    tools=tool_defs.READ_TOOLS,
+                    fallback_model=fallback,
                 )
             yield
         await aclose_http()

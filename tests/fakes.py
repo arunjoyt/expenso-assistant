@@ -11,7 +11,7 @@ from types import SimpleNamespace
 from typing import Any
 
 from langchain_core.language_models import BaseChatModel
-from langchain_core.messages import AIMessageChunk
+from langchain_core.messages import AIMessage, AIMessageChunk, ToolMessage
 from langchain_core.outputs import ChatGeneration, ChatGenerationChunk, ChatResult
 from pydantic import Field, PrivateAttr
 
@@ -34,6 +34,7 @@ class ScriptedChatModel(BaseChatModel):
     def _next(self, messages=None):
         self.calls += 1
         if messages is not None:
+            _reject_unanswered_tool_calls(messages)
             self.last_prompt = list(messages)
         message = self.responses[self._cursor]
         self._cursor += 1
@@ -143,3 +144,14 @@ class SpyLangfuse:
 
     def flush(self) -> None:
         self.flushed += 1
+
+
+def _reject_unanswered_tool_calls(messages) -> None:
+    """What OpenAI does (HTTP 400): every tool call in the prompt needs a
+    `ToolMessage` answer. Without this, a thread left with an orphaned call
+    passes every test and fails every turn in prod (ADR 0010)."""
+    answered = {m.tool_call_id for m in messages if isinstance(m, ToolMessage)}
+    for message in messages:
+        for call in getattr(message, "tool_calls", None) or []:
+            if isinstance(message, AIMessage) and call["id"] not in answered:
+                raise ValueError(f"tool call {call['id']} has no ToolMessage")

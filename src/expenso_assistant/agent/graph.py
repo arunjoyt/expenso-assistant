@@ -1,51 +1,100 @@
-"""The LangGraph agent — a hand-rolled `agent <-> tools` state graph.
+"""The LangGraph agent — LangChain v1 `create_agent` with stock middleware.
 
 Binds the `tools.py` functions **directly** as LangChain tools (ADR 0008): no
-MCP protocol, no `langchain[mcp]`, no MCP client anywhere in this package. The
-graph is hand-rolled rather than `create_react_agent` so the per-turn tool-call
-cap can live in graph state and a `propose` node can sit in front of the writes.
+MCP protocol, no `langchain[mcp]`, no MCP client anywhere in this package.
 
-`tools=` defaults to **all** tools (the interactive turn). A message with any
-write call routes to `propose` (P6-S7) — the write functions never run inline;
-read-only calls still go to `tools`. Proactive runs pass `tools=READ_TOOLS`, so
-`route()` can never reach `propose` there.
+ADR 0010: the loop, the tool-call cap, history editing and the write
+confirmation are all stock LangChain. The one custom middleware is
+`ModelCallShaping` (prompt, receipt image, proactive instruction).
+
+`tools=` defaults to **all** tools (the interactive turn): every write tool
+pauses on the stock human-in-the-loop confirm card. Proactive runs pass
+`tools=READ_TOOLS`, which leaves the confirm step out entirely.
 """
 
 from __future__ import annotations
 
 from collections.abc import Callable, Sequence
-from datetime import UTC, date, datetime
-from functools import lru_cache
-from typing import Annotated, Any, TypedDict
+from typing import Any
 
-import tiktoken
+import httpx
+from langchain.agents import create_agent
+from langchain.agents.middleware import (
+    ClearToolUsesEdit,
+    ContextEditingMiddleware,
+    HumanInTheLoopMiddleware,
+    InterruptOnConfig,
+    ModelFallbackMiddleware,
+    ToolCallLimitMiddleware,
+    ToolErrorMiddleware,
+    ToolRetryMiddleware,
+)
 from langchain_core.language_models import BaseChatModel
-from langchain_core.messages import AnyMessage, HumanMessage, SystemMessage, trim_messages
 from langchain_core.tools import StructuredTool
 from langgraph.checkpoint.base import BaseCheckpointSaver
-from langgraph.graph import END, START, StateGraph
-from langgraph.graph.message import add_messages
-from langgraph.prebuilt import ToolNode
 
 from .. import tools as tool_defs
 from ..config import get_settings
-from .prompt import render_system_prompt
-from .propose import propose_node
+from ..frappe_client import FrappeError
+from .describe import describe_write
+from .middleware import ModelCallShaping
+from .state import ExpensoState, RunContext
+
+__all__ = ["bound_tool_names", "build_graph"]
 
 
-class ToolCapExceeded(RuntimeError):
-    """The agent asked for more tool calls in one turn than `run_max_tool_calls`."""
+def build_graph(
+    model: BaseChatModel,
+    *,
+    checkpointer: BaseCheckpointSaver,
+    tools: Sequence[Callable[..., Any]] | None = None,
+    fallback_model: BaseChatModel | None = None,
+):
+    fns = _resolve_tools(tools)
+    settings = get_settings()
+    # No write tool bound means a proactive run (P7-S2): picks the prompt's tone.
+    read_only = not any(fn.__name__ in tool_defs.WRITE_TOOL_NAMES for fn in fns)
 
+    # `wrap_*` hooks nest in list order: the first is the outermost.
+    middleware = [
+        ModelCallShaping(read_only=read_only),
+        *([ModelFallbackMiddleware(fallback_model)] if fallback_model else []),
+        # Transient: clears old tool outputs from what the model sees; the
+        # checkpointed thread stays whole (the GLOSSARY promise).
+        ContextEditingMiddleware(
+            edits=[ClearToolUsesEdit(trigger=settings.chat_history_token_budget)]
+        ),
+    ]
+    if not read_only:
+        middleware.append(HumanInTheLoopMiddleware(interrupt_on=_confirm_every_write()))
+    # A Frappe rejection (validation, a stale-write conflict) goes back to the
+    # model as an error ToolMessage, so the other calls in a batch still run.
+    middleware.append(ToolErrorMiddleware(on_error=_frappe_error_text))
+    # Inside ToolErrorMiddleware, as its docs require. Reads only: a write that
+    # timed out may still have committed, so retrying it could duplicate a row.
+    middleware.append(
+        ToolRetryMiddleware(
+            tools=[fn.__name__ for fn in fns if fn.__name__ not in tool_defs.WRITE_TOOL_NAMES],
+            retry_on=_is_transient,
+            max_retries=2,
+            initial_delay=0.5,
+            on_failure="error",
+        )
+    )
+    # Last, so its `after_model` hook runs first: a turn over the cap fails
+    # before a confirm card is shown for it.
+    middleware.append(
+        ToolCallLimitMiddleware(run_limit=settings.run_max_tool_calls, exit_behavior="error")
+    )
 
-class AgentState(TypedDict):
-    messages: Annotated[list[AnyMessage], add_messages]
-    tool_call_count: int
-    # Reset fresh in `inputs` at the start of every `/chat` turn (like
-    # `tool_call_count`), so it's a pure function of state — unlike the
-    # `tools.py` contextvar, which reads back as "assistant" on the resume
-    # replay of `propose_node` (P7-S1 grill: the node re-runs from the top on
-    # resume, so anything it reads must survive in state, not ambient context).
-    entry_method: str
+    return create_agent(
+        model,
+        tools=[_as_lc_tool(fn) for fn in fns],
+        middleware=middleware,
+        state_schema=ExpensoState,
+        context_schema=RunContext,
+        checkpointer=checkpointer,
+    )
 
 
 def bound_tool_names(tools: Sequence[Callable[..., Any]] | None = None) -> set[str]:
@@ -54,171 +103,36 @@ def bound_tool_names(tools: Sequence[Callable[..., Any]] | None = None) -> set[s
     return {fn.__name__ for fn in _resolve_tools(tools)}
 
 
-def build_graph(
-    model: BaseChatModel,
-    *,
-    checkpointer: BaseCheckpointSaver,
-    tools: Sequence[Callable[..., Any]] | None = None,
-):
-    fns = _resolve_tools(tools)
-    lc_tools = [
-        StructuredTool.from_function(
-            coroutine=fn, name=fn.__name__, description=fn.__doc__ or fn.__name__
-        )
-        for fn in fns
-    ]
-    model_with_tools = model.bind_tools(lc_tools)
-    tool_node = ToolNode(lc_tools)
-    max_tool_calls = get_settings().run_max_tool_calls
-    history_token_budget = get_settings().chat_history_token_budget
-    count_tokens = _token_counter(get_settings().openai_model)
-    # No write tool in `fns` means this is a proactive run (P7-S2) — used to pick
-    # the system prompt's tone, not a re-check of what's bound (route() already
-    # enforces that structurally).
-    read_only = not any(fn.__name__ in tool_defs.WRITE_TOOL_NAMES for fn in fns)
+def _confirm_every_write() -> dict[str, InterruptOnConfig]:
+    config = InterruptOnConfig(
+        allowed_decisions=["approve", "edit", "reject"], description=describe_write
+    )
+    return {name: config for name in tool_defs.WRITE_TOOL_NAMES}
 
-    async def agent_node(state: AgentState, config) -> dict:
-        if state.get("tool_call_count", 0) >= max_tool_calls:
-            raise ToolCapExceeded(f"more than {max_tool_calls} tool calls in one turn")
-        today = date.fromisoformat(config["configurable"]["today"])
-        configurable = config.get("configurable") or {}
-        instruction = configurable.get("proactive_instruction")
-        prompt = SystemMessage(render_system_prompt(today, proactive=read_only))
-        messages = _windowed(state["messages"], count_tokens, history_token_budget)
-        messages = _with_receipt_image(messages, configurable.get("receipt_image"))
-        messages = _with_proactive_instruction(messages, instruction)
-        reply = await model_with_tools.ainvoke([prompt, *messages], config)
-        if instruction:
-            # Tags this run's reply(ies) as an Insight for the transcript
-            # (P7-S2) — every reply in a proactive turn gets it, including an
-            # intermediate tool-call message, but `history()` only surfaces the
-            # final content-only one, so that's harmless.
-            reply.additional_kwargs = {
-                **reply.additional_kwargs,
-                "kind": "insight",
-                "posted_at": datetime.now(UTC).isoformat(),
-            }
-        return {"messages": [reply]}
 
-    async def tools_node(state: AgentState, config) -> dict:
-        result = await tool_node.ainvoke(state, config)
-        result["tool_call_count"] = state.get("tool_call_count", 0) + 1
-        return result
+def _is_transient(exc: Exception) -> bool:
+    if isinstance(exc, httpx.TransportError):  # connect / read timeout, reset
+        return True
+    return isinstance(exc, FrappeError) and exc.status_code in _TRANSIENT_STATUS
 
-    def route(state: AgentState) -> str:
-        messages = state["messages"]
-        if not messages:
-            # A proactive thread's state can be emptied by `discard_pending`
-            # clearing a stale interactive proposal (no persisted HumanMessage
-            # ever anchors it) — expenso-assistant#1. Nothing to route on.
-            return END
-        calls = getattr(messages[-1], "tool_calls", None)
-        if not calls:
-            return END
-        if any(c["name"] in tool_defs.WRITE_TOOL_NAMES for c in calls):
-            return "propose"
-        return "tools"
 
-    graph = StateGraph(AgentState)
-    graph.add_node("agent", agent_node)
-    graph.add_node("tools", tools_node)
-    graph.add_node("propose", propose_node)
-    graph.add_edge(START, "agent")
-    graph.add_conditional_edges("agent", route, {"tools": "tools", "propose": "propose", END: END})
-    graph.add_edge("tools", "agent")
-    graph.add_edge("propose", "agent")
-    return graph.compile(checkpointer=checkpointer)
+_TRANSIENT_STATUS = frozenset({429, 502, 503, 504})
+
+
+def _frappe_error_text(exc: Exception, request) -> str | None:
+    if not isinstance(exc, FrappeError):
+        return None  # anything else is a bug: let it fail the turn
+    name = request.tool_call["name"]
+    if "TimestampMismatchError" in exc.detail:
+        return f"{name}: the row changed since you read it — re-read it and propose again."
+    return f"{name} could not be applied: {exc.detail}"
+
+
+def _as_lc_tool(fn: Callable[..., Any]) -> StructuredTool:
+    return StructuredTool.from_function(
+        coroutine=fn, name=fn.__name__, description=fn.__doc__ or fn.__name__
+    )
 
 
 def _resolve_tools(tools: Sequence[Callable[..., Any]] | None) -> list[Callable[..., Any]]:
     return list(tools if tools is not None else tool_defs.ALL_TOOLS)
-
-
-@lru_cache(maxsize=4)
-def _encoding_for(model_name: str) -> tiktoken.Encoding:
-    try:
-        return tiktoken.encoding_for_model(model_name)
-    except KeyError:
-        return tiktoken.get_encoding("cl100k_base")
-
-
-def _token_counter(model_name: str) -> Callable[[list[AnyMessage]], int]:
-    """A tiktoken-based counter for `_windowed`, deliberately not routed
-    through the bound model's own `get_num_tokens_from_messages`: that works
-    for the real `ChatOpenAI` (tiktoken-backed) but not for a plain
-    `BaseChatModel` double like the test fakes, which fall through to
-    LangChain's default tokenizer and require the `transformers` package.
-    Approximate (content only, no per-message role/name overhead) — fine for
-    a soft budget, not a billing figure."""
-    encoding = _encoding_for(model_name)
-
-    def count(messages: list[AnyMessage]) -> int:
-        total = 0
-        for message in messages:
-            content = message.content
-            text = content if isinstance(content, str) else str(content)
-            total += len(encoding.encode(text))
-        return total
-
-    return count
-
-
-def _windowed(
-    messages: list[AnyMessage], count_tokens: Callable[[list[AnyMessage]], int], budget: int
-) -> list[AnyMessage]:
-    """A transient token-count trim of persisted history (2026-09-11 grill) —
-    the same shape as `_with_receipt_image`/`_with_proactive_instruction`
-    below: computed fresh before each model call, never returned from
-    `agent_node`, so the checkpoint (and everything `GET /history` replays)
-    stays the full, ever-growing thread the GLOSSARY promises — only what's
-    sent to the model is bounded. `start_on=("human", "ai")` keeps the window
-    from starting mid a tool-call/tool-result pair, which OpenAI's API
-    rejects — a `ToolMessage` is never a valid start. It also fixes a real bug
-    (expenso-assistant#1): a proactive run's `state["messages"]` never carries
-    a persisted `HumanMessage` (the instruction lives in `config`, injected by
-    `_with_proactive_instruction` after this runs), so after the first
-    tool-call cycle the window was `[AIMessage(tool_call), ToolMessage(...)]`
-    with no `human` anchor at all — `start_on="human"` alone returned `[]`,
-    silently dropping the tool result every cycle and looping until
-    `ToolCapExceeded`. Allowing an `ai` start lets the window begin at that
-    `AIMessage` instead."""
-    return trim_messages(
-        messages,
-        max_tokens=budget,
-        token_counter=count_tokens,
-        strategy="last",
-        start_on=("human", "ai"),
-    )
-
-
-def _with_receipt_image(messages: list[AnyMessage], image: str | None) -> list[AnyMessage]:
-    """A transient copy of `messages` for one model call, with the newest
-    `HumanMessage` turned multimodal (P7-S1). Never returned from `agent_node`,
-    so the image never reaches checkpointed state — re-built on every loop
-    iteration in the turn since each model call is otherwise stateless."""
-    if not image:
-        return messages
-    for i in range(len(messages) - 1, -1, -1):
-        if isinstance(messages[i], HumanMessage):
-            text = messages[i].content if isinstance(messages[i].content, str) else ""
-            multimodal = HumanMessage(
-                content=[
-                    {"type": "text", "text": text},
-                    {"type": "image_url", "image_url": {"url": image}},
-                ]
-            )
-            return [*messages[:i], multimodal, *messages[i + 1 :]]
-    return messages
-
-
-def _with_proactive_instruction(
-    messages: list[AnyMessage], instruction: str | None
-) -> list[AnyMessage]:
-    """An ephemeral trailing instruction for a proactive run (P7-S2), riding in
-    `config` exactly like the receipt image above — never returned from
-    `agent_node`, so it is never checkpointed. The job description (which
-    Categories crossed budget, which month to summarize) is decided in
-    `agent/proactive.py`, not by the model."""
-    if not instruction:
-        return messages
-    return [*messages, HumanMessage(instruction)]

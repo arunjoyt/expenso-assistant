@@ -22,7 +22,8 @@ from ..auth import AuthedMember
 from ..config import Settings
 from ..frappe_client import FrappeClient, bind_frappe_client, reset_frappe_client
 from .observability import FEATURE_INSIGHTS, TurnTrace
-from .session import discard_pending, pending_card
+from .session import discard_pending
+from .state import RunContext
 
 logger = logging.getLogger(__name__)
 
@@ -101,13 +102,16 @@ async def _categories_over_budget(member: AuthedMember, month: int, year: int) -
 async def _post_insight(
     *, member: AuthedMember, graph, settings: Settings, instruction: str
 ) -> None:
-    config = _proactive_config(member, settings, instruction=instruction)
+    config = {
+        "configurable": {"thread_id": member.thread_id},
+        "recursion_limit": settings.run_recursion_limit,
+    }
+    context = RunContext(today=_today(settings), proactive_instruction=instruction)
 
     # A proactive run touching this thread discards any stale unconfirmed
     # proposal, same rule `stream_turn` already applies to a new live message
     # (P7-S2 grill: "the thread is linear").
-    if await pending_card(graph, config) is not None:
-        await discard_pending(graph, config)
+    await discard_pending(graph, config)
 
     trace = TurnTrace.start(
         user_id=member.email,
@@ -120,9 +124,9 @@ async def _post_insight(
     client_token = bind_frappe_client(FrappeClient(member.token))
     entry_token = tool_defs.bind_entry_method("assistant")
     try:
-        inputs = {"messages": [], "tool_call_count": 0, "entry_method": "assistant"}
+        inputs = {"messages": [], "entry_method": "assistant"}
         result = await asyncio.wait_for(
-            graph.ainvoke(inputs, config), timeout=settings.run_wall_clock_seconds
+            graph.ainvoke(inputs, config, context=context), timeout=settings.run_wall_clock_seconds
         )
         trace.finish(output=_final_text(result))
     except Exception:
@@ -132,16 +136,6 @@ async def _post_insight(
         tool_defs.reset_entry_method(entry_token)
         reset_frappe_client(client_token)
         _flush_trace()
-
-
-def _proactive_config(member: AuthedMember, settings: Settings, *, instruction: str) -> dict:
-    today = _today(settings).isoformat()
-    configurable = {
-        "thread_id": member.thread_id,
-        "today": today,
-        "proactive_instruction": instruction,
-    }
-    return {"configurable": configurable, "recursion_limit": settings.run_recursion_limit}
 
 
 def _final_text(result: dict) -> str:

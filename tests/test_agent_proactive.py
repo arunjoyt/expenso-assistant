@@ -58,13 +58,12 @@ async def test_monthly_summary_always_calls_the_model_and_posts_a_tagged_insight
 @respx.mock
 async def test_monthly_summary_survives_a_tool_call_before_the_answer(member):
     """expenso-assistant#1 regression: a proactive run's `state["messages"]`
-    never carries a persisted `HumanMessage` (the instruction lives in
-    `config`, injected after `_windowed` runs), so once the model makes a
-    tool call, the second `agent_node` cycle used to see
-    `[AIMessage(tool_call), ToolMessage(...)]` with no `human` anchor at all —
-    `_windowed`'s `start_on="human"` trim returned `[]`, silently dropping the
-    tool result every cycle, so the model re-issued the same call forever and
-    the run died to `ToolCapExceeded` without ever posting an Insight. This is
+    never carries a persisted `HumanMessage` (the instruction is injected per
+    model call), so once the model made a tool call, the old history window
+    (`start_on="human"`, replaced by stock context editing in ADR 0010) saw no
+    `human` anchor and returned `[]` — silently dropping the tool result every
+    cycle, so the model re-issued the same call forever and the run died to
+    the tool-call cap without ever posting an Insight. This is
     exactly the path the proactive system prompt tells the model to take
     ("read what you need") and the one the pre-fix test suite never scripted."""
     respx.get(method_url(f"{API}.get_expenses")).mock(

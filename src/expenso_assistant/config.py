@@ -61,6 +61,10 @@ class Settings(BaseSettings):
     # OpenAI — one key for the whole product, admin-capped on the OpenAI dashboard.
     openai_api_key: str = ""
     openai_model: str = "gpt-4o-mini"
+    # Tried by the stock `ModelFallbackMiddleware` when `openai_model` still
+    # fails after the SDK's own retries (ADR 0010). Empty turns fallback off.
+    # Its tokens count against the daily cap like any other.
+    openai_fallback_model: str = ""
 
     # Frappe is the OAuth authorization server and the system of record.
     frappe_url: str = "http://localhost:8000"
@@ -95,11 +99,14 @@ class Settings(BaseSettings):
     # timezone context; one Family in v1.
     service_timezone: str = "Asia/Kolkata"
 
-    # Per-run runaway guard (P6-S5). One agent->tools cycle is two graph
-    # super-steps, so the recursion limit sits above 2 x run_max_tool_calls to
-    # keep the tool-call cap the one that bites first; recursion is the backstop
-    # for a pathological loop that never calls a tool.
-    run_recursion_limit: int = 50
+    # Per-run runaway guard (P6-S5). `run_max_tool_calls` feeds the stock
+    # `ToolCallLimitMiddleware` (ADR 0010): it counts single tool calls, and
+    # resets when `/resume` starts a new run. One `create_agent` cycle is up
+    # to four graph super-steps (model, two `after_model` hooks, tools), so the
+    # recursion limit sits above 4 x run_max_tool_calls to keep the tool-call
+    # cap the one that bites first; recursion is the backstop for a
+    # pathological loop that never calls a tool.
+    run_recursion_limit: int = 100
     run_max_tool_calls: int = 20
     run_wall_clock_seconds: int = 90
 
@@ -110,24 +117,16 @@ class Settings(BaseSettings):
     # — replaces the old turn-count `daily_chat_cap`).
     daily_token_cap: int = 500_000
 
-    # How much of a thread's persisted history is resent to the model on each
-    # turn — bounds the token count, not the message count, since tool-result
-    # messages vary hugely in size (ADR 0008's 2026-09-11 update). Applied
-    # transiently in `agent_node`; the checkpointed thread itself is never
-    # trimmed, so `GET /history` and "Clear chat" are unaffected.
+    # Above this many (approximate) tokens, the stock `ContextEditingMiddleware`
+    # clears older tool outputs from what the model sees (ADR 0010) — tool
+    # results are what vary hugely in size. Transient: the checkpointed thread
+    # is never edited, so `GET /history` and "Clear chat" are unaffected.
     chat_history_token_budget: int = 20_000
 
     # A secondary bound alongside the daily token cap: no single message can
     # consume an outsized share of one day's budget in one turn (ADR 0008's
     # 2026-09-11 update).
     max_chat_message_chars: int = 4_000
-
-    # Confirm-card batch cap (P6-S7): the propose node shows at most this many
-    # proposed writes per card and tells the model to continue with the rest.
-    # This replaced the daily write cap — every in-app write is Member-confirmed,
-    # so the useful bound is blast radius per confirmation, not a daily total
-    # (ADR 0008's 2026-09-10 P6-S7 update).
-    max_proposed_writes_per_turn: int = 25
 
     http_timeout_seconds: float = 30.0
 

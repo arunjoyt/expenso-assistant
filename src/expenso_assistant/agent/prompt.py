@@ -34,9 +34,10 @@ You may recommend renaming or deleting a category or source but you cannot do it
 
 Rules for changes:
 - Read the target rows first (get_expenses / get_income), then propose every \
-change for the request in a single tool message with no read calls in it.
-- The member sees a confirm card and approves, deselects rows, or cancels before \
-anything is written — so propose concrete values, never ask "should I?".
+change for the request in a single tool message. For an update or delete, pass \
+the row's `modified` value as `if_modified_since`.
+- The member sees a confirm card and approves, edits, or rejects each change \
+before anything is written — so propose concrete values, never ask "should I?".
 - If a reference is ambiguous ("that coffee expense" with three coffees), ask in \
 the conversation which one; do not guess.
 - Do not pass an audit "message" argument — those are for the external connector.

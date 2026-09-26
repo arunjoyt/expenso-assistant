@@ -21,6 +21,7 @@ from collections.abc import AsyncIterator
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
+from langchain.agents.middleware.tool_call_limit import ToolCallLimitExceededError
 from langchain_core.messages import AIMessage, HumanMessage, RemoveMessage
 from langgraph.errors import GraphRecursionError
 from langgraph.types import Command
@@ -29,8 +30,14 @@ from .. import tools as tool_defs
 from ..auth import AuthedMember
 from ..config import Settings
 from ..frappe_client import FrappeClient, bind_frappe_client, reset_frappe_client
-from .graph import ToolCapExceeded
-from .observability import FEATURE_CHAT, FEATURE_RECEIPT, TurnTrace, within_daily_token_cap
+from .observability import (
+    FEATURE_CHAT,
+    FEATURE_RECEIPT,
+    TurnTrace,
+    score_receipt_accuracy,
+    within_daily_token_cap,
+)
+from .state import RunContext
 
 logger = logging.getLogger(__name__)
 
@@ -78,7 +85,8 @@ async def stream_turn(
         yield sse("error", {"code": "daily_cap", "message": "You've reached today's usage limit."})
         return
 
-    config = _run_config(member, settings, image=image)
+    config = _run_config(member, settings)
+    context = _run_context(settings, image=image)
     entry_method = "receipt" if image else "assistant"
     feature = FEATURE_RECEIPT if image else FEATURE_CHAT
 
@@ -104,10 +112,9 @@ async def stream_turn(
         human_text = _human_text(text, image)
         inputs = {
             "messages": [HumanMessage(human_text)],
-            "tool_call_count": 0,
             "entry_method": entry_method,
         }
-        async for event in _drive(graph, inputs, config, trace, pre_ids, settings):
+        async for event in _drive(graph, inputs, config, context, trace, pre_ids, settings):
             yield event
     finally:
         tool_defs.reset_entry_method(entry_token)
@@ -122,7 +129,8 @@ async def resume_turn(
     subset (P6-S7) and streams the continuation on a fresh SSE leg — its own
     Langfuse trace, no chat-cap re-check (the turn already passed it)."""
     config = _run_config(member, settings)
-    if await pending_card(graph, config) is None:
+    card = await pending_card(graph, config)
+    if card is None:
         yield sse("error", {"code": "nothing_to_resume", "message": "No pending confirmation."})
         return
 
@@ -130,13 +138,18 @@ async def resume_turn(
         user_id=member.email, session_id=member.thread_id, user_input=json.dumps(decision)
     )
     config["callbacks"] = [trace.callback]
-    # propose.py's _apply reads this to post receipt_accuracy_* scores here —
-    # the comparison only exists once the Member confirms/edits (P7-S1).
-    config["configurable"]["trace"] = trace
+    # The approved writes run on this leg, so they must carry the turn's own
+    # entry method ("receipt" survives the pause in state, P7-S1).
+    state = await graph.aget_state(config)
+    entry_method = (state.values or {}).get("entry_method", "assistant")
+    if entry_method == "receipt":
+        score_receipt_accuracy(card, decision, trace)
+    context = _run_context(settings)
     client_token = bind_frappe_client(FrappeClient(member.token))
-    entry_token = tool_defs.bind_entry_method("assistant")
+    entry_token = tool_defs.bind_entry_method(entry_method)
     try:
-        async for event in _drive(graph, Command(resume=decision), config, trace, None, settings):
+        resume = Command(resume=decision)
+        async for event in _drive(graph, resume, config, context, trace, None, settings):
             yield event
     finally:
         tool_defs.reset_entry_method(entry_token)
@@ -154,7 +167,7 @@ async def history(graph, member: AuthedMember, settings: Settings) -> list[dict]
         elif isinstance(message, AIMessage) and message.content and not message.tool_calls:
             entry = {"id": message.id, "role": "assistant", "content": message.content}
             # A proactive Insight (P7-S2) is tagged in `additional_kwargs` by
-            # `graph.py`'s `agent_node`; sparse and optional, same pattern as
+            # `middleware.py`'s `ModelCallShaping`; sparse and optional, same pattern as
             # P7-S1's `edits` — an ordinary reply carries neither key.
             if message.additional_kwargs.get("kind") == "insight":
                 entry["kind"] = "insight"
@@ -170,16 +183,18 @@ async def clear_thread(checkpointer, member: AuthedMember) -> None:
 # --- internals ------------------------------------------------------------
 
 
-def _run_config(member: AuthedMember, settings: Settings, *, image: str | None = None) -> dict:
-    # `today` as an ISO string, not a date — it rides in `configurable`, which
-    # the Postgres checkpointer serializes as JSON. `receipt_image` rides here
-    # too (P7-S1) rather than in graph state, precisely so it is never
-    # checkpointed — `config` is per-run, `state` is what Postgres persists.
-    today = datetime.now(ZoneInfo(settings.service_timezone)).date().isoformat()
-    configurable = {"thread_id": member.thread_id, "today": today}
-    if image:
-        configurable["receipt_image"] = image
-    return {"configurable": configurable, "recursion_limit": settings.run_recursion_limit}
+def _run_config(member: AuthedMember, settings: Settings) -> dict:
+    return {
+        "configurable": {"thread_id": member.thread_id},
+        "recursion_limit": settings.run_recursion_limit,
+    }
+
+
+def _run_context(settings: Settings, *, image: str | None = None) -> RunContext:
+    # The receipt image rides in the run context (P7-S1), not in graph state,
+    # precisely so it is never checkpointed.
+    today = datetime.now(ZoneInfo(settings.service_timezone)).date()
+    return RunContext(today=today, receipt_image=image)
 
 
 def _human_text(text: str, image: str | None) -> str:
@@ -192,29 +207,33 @@ def _human_text(text: str, image: str | None) -> str:
 
 
 async def _drive(
-    graph, inputs, config, trace: TurnTrace, pre_ids, settings: Settings
+    graph, inputs, config, context: RunContext, trace: TurnTrace, pre_ids, settings: Settings
 ) -> AsyncIterator[str]:
-    answer: list[str] = []
+    """Streams the run with LangGraph's own stream modes (ADR 0010): `tasks`
+    for each tool as it runs, `messages` for answer tokens, `updates` for the
+    confirm card and the final reply's id."""
+    run = _RunStream()
     deadline = asyncio.get_event_loop().time() + settings.run_wall_clock_seconds
-    events = graph.astream_events(inputs, config, version="v2")
+    parts = graph.astream(
+        inputs,
+        config,
+        context=context,
+        stream_mode=_STREAM_MODES,
+        durability=_DURABILITY,
+        version="v2",
+    )
     try:
         while True:
             remaining = deadline - asyncio.get_event_loop().time()
             if remaining <= 0:
                 raise TimeoutError
             try:
-                event = await asyncio.wait_for(events.__anext__(), timeout=remaining)
+                part = await asyncio.wait_for(parts.__anext__(), timeout=remaining)
             except StopAsyncIteration:
                 break
-            kind = event["event"]
-            if kind == "on_tool_start":
-                yield sse("step", {"text": humanize(event["name"], event["data"].get("input"))})
-            elif kind == "on_chat_model_stream":
-                piece = _chunk_text(event["data"].get("chunk"))
-                if piece:
-                    answer.append(piece)
-                    yield sse("token", {"text": piece})
-    except (TimeoutError, GraphRecursionError, ToolCapExceeded) as exc:
+            for event in run.read(part):
+                yield event
+    except (TimeoutError, GraphRecursionError, ToolCallLimitExceededError) as exc:
         code = _ERROR_CODES[type(exc)]
         await _rollback(graph, config, pre_ids)
         trace.fail(code)
@@ -227,21 +246,60 @@ async def _drive(
         yield sse("error", {"code": "internal", "message": _ERROR_MESSAGES["internal"]})
         return
 
-    card = await pending_card(graph, config)
-    if card is not None:
+    if run.card is not None:
         trace.finish(output="[needs confirmation]")
-        yield sse("needs_confirmation", card)
+        yield sse("needs_confirmation", run.card)
         return
 
-    final = "".join(answer)
-    trace.finish(output=final)
-    yield sse("done", {"message_id": await _latest_ai_id(graph, config)})
+    trace.finish(output="".join(run.answer))
+    yield sse("done", {"message_id": run.message_id})
+
+
+_STREAM_MODES = ["tasks", "messages", "updates"]
+# LangGraph's default, stated on purpose (ADR 0010): each step is saved while
+# the next runs. "exit" would save only when the run ends — fewer Postgres
+# writes, but a crash mid-resume would lose the record of a committed write,
+# reopen the card, and let a re-confirm duplicate the row.
+_DURABILITY = "async"
+
+
+class _RunStream:
+    """Turns LangGraph v2 stream parts into SSE events, keeping what the end
+    of the leg needs: the answer text, the confirm card, the reply's id."""
+
+    def __init__(self):
+        self.answer: list[str] = []
+        self.card: dict | None = None
+        self.message_id: str | None = None
+
+    def read(self, part: dict) -> list[str]:
+        kind, data = part["type"], part["data"]
+        if kind == "tasks" and data.get("name") == "tools" and "input" in data:
+            return [
+                sse("step", {"text": humanize(c["name"], c.get("args"))}) for c in data["input"]
+            ]
+        if kind == "messages":
+            message, meta = data
+            piece = _chunk_text(message) if meta.get("langgraph_node") == "model" else ""
+            if piece:
+                self.answer.append(piece)
+                return [sse("token", {"text": piece})]
+        if kind == "updates":
+            self._read_update(data)
+        return []
+
+    def _read_update(self, data: dict) -> None:
+        if interrupts := data.get("__interrupt__"):
+            self.card = interrupts[0].value
+        reply = ((data.get("model") or {}).get("messages") or [None])[-1]
+        if isinstance(reply, AIMessage) and reply.content and not reply.tool_calls:
+            self.message_id = reply.id
 
 
 _ERROR_CODES = {
     TimeoutError: "wall_clock",
     GraphRecursionError: "recursion",
-    ToolCapExceeded: "tool_cap",
+    ToolCallLimitExceededError: "tool_cap",
 }
 
 _ERROR_MESSAGES = {
@@ -271,14 +329,6 @@ async def _message_ids(graph, config) -> set[str]:
     return {m.id for m in (state.values or {}).get("messages", [])}
 
 
-async def _latest_ai_id(graph, config) -> str | None:
-    state = await graph.aget_state(config)
-    for message in reversed((state.values or {}).get("messages", [])):
-        if isinstance(message, AIMessage) and message.content:
-            return message.id
-    return None
-
-
 async def pending_card(graph, config) -> dict | None:
     """The confirm-card payload if the graph is paused on an `interrupt`."""
     state = await graph.aget_state(config)
@@ -289,20 +339,22 @@ async def pending_card(graph, config) -> dict | None:
 
 
 async def discard_pending(graph, config) -> bool:
-    """Throw away an unconfirmed proposal: drop the AI message whose write
-    tool-calls opened the card, and re-route from `agent` so `state.next` clears.
-    Returns whether there was one."""
-    if await pending_card(graph, config) is None:
-        return False
+    """Throw away an unconfirmed proposal: drop the trailing AI message whose
+    tool calls were never answered. Returns whether there was one.
+
+    Found from state, not from the paused interrupt: a deploy that changes the
+    graph's node names loses the paused task but keeps the message, and
+    OpenAI rejects a tool call with no `ToolMessage` — every later turn in the
+    thread would fail (ADR 0010, spike results)."""
     state = await graph.aget_state(config)
     messages = (state.values or {}).get("messages", [])
-    for message in reversed(messages):
-        if isinstance(message, AIMessage) and getattr(message, "tool_calls", None):
-            await graph.aupdate_state(
-                config, {"messages": [RemoveMessage(id=message.id)]}, as_node="agent"
-            )
-            return True
-    return False
+    if not messages or not getattr(messages[-1], "tool_calls", None):
+        return False
+    # Any task this leaves pending is dropped when the next run's input arrives.
+    await graph.aupdate_state(
+        config, {"messages": [RemoveMessage(id=messages[-1].id)]}, as_node="model"
+    )
+    return True
 
 
 async def _rollback(graph, config, pre_ids: set[str] | None) -> None:

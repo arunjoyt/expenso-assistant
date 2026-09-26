@@ -1,4 +1,4 @@
-"""P6-S7 — agent writes: the propose node, the confirm card, /resume.
+"""Agent writes: the stock human-in-the-loop confirm card and /resume (ADR 0010).
 
 The scripted model keeps OpenAI out; respx stubs the Frappe REST writes.
 """
@@ -12,6 +12,7 @@ import pytest
 import respx
 from langchain_core.messages import AIMessage, ToolMessage
 from langgraph.checkpoint.memory import InMemorySaver
+from langgraph.graph import END
 
 from expenso_assistant.agent import session
 from expenso_assistant.agent.graph import build_graph
@@ -47,10 +48,22 @@ def multi_call(*calls: tuple[str, dict]) -> AIMessage:
     )
 
 
-def _stub_get_expenses(rows: list[dict]) -> None:
-    respx.get(method_url(f"{API}.get_expenses")).mock(
+def _stub_get_expenses(rows: list[dict]):
+    return respx.get(method_url(f"{API}.get_expenses")).mock(
         return_value=httpx.Response(200, json={"message": rows})
     )
+
+
+def approve() -> dict:
+    return {"type": "approve"}
+
+
+def reject() -> dict:
+    return {"type": "reject"}
+
+
+def edit(name: str, args: dict) -> dict:
+    return {"type": "edit", "edited_action": {"name": name, "args": args}}
 
 
 async def _resume(graph, member, decision) -> list[tuple[str, dict]]:
@@ -63,7 +76,7 @@ async def _resume(graph, member, decision) -> list[tuple[str, dict]]:
 
 
 @respx.mock
-async def test_write_call_routes_to_propose_and_interrupts(member):
+async def test_write_call_pauses_on_a_confirm_card(member):
     _stub_get_expenses([EXPENSE_ROW])
     write_route = respx.post(method_url(f"{API}.update_expense")).mock(
         return_value=httpx.Response(200, json={"message": {"name": "EXP-17"}})
@@ -80,16 +93,18 @@ async def test_write_call_routes_to_propose_and_interrupts(member):
 
     assert events[-1][0] == "needs_confirmation"
     assert "done" not in [k for k, _ in events]
-    (action,) = events[-1][1]["actions"]
-    assert action["kind"] == "update"
-    assert action["entity"] == "expense"
-    assert {"field": "amount", "from": 4.5, "to": 6.0} in action["changes"]
-    assert "if_modified_since" not in action  # server-side only
+    (request,) = events[-1][1]["action_requests"]
+    assert request["name"] == "update_expense"
+    assert request["args"] == {"name": "EXP-17", "amount": 6.0}
+    assert "4.5 · Dining" in request["description"]
+    assert "amount: 4.5 → 6.0" in request["description"]
+    (review,) = events[-1][1]["review_configs"]
+    assert review["allowed_decisions"] == ["approve", "edit", "reject"]
     assert not write_route.called
 
 
 @respx.mock
-async def test_read_only_call_never_reaches_propose(member):
+async def test_read_only_call_never_pauses(member):
     _stub_get_expenses([EXPENSE_ROW])
     model = ScriptedChatModel(
         responses=[tool_call("get_expenses", month=3, year=2026), answer("You spent 4.5.")]
@@ -103,29 +118,50 @@ async def test_read_only_call_never_reaches_propose(member):
 
 
 @respx.mock
-async def test_target_not_in_history_nudges_without_interrupting(member):
+async def test_a_target_not_in_history_is_flagged_on_the_card(member):
+    """ADR 0010 dropped the 're-read first' nudge: the card still opens, and
+    says plainly that the row was not read."""
     _stub_get_expenses([EXPENSE_ROW])
     model = ScriptedChatModel(
         responses=[
             tool_call("get_expenses", month=3, year=2026),
             multi_call(("update_expense", {"name": "EXP-999", "amount": 6.0})),
-            answer("I could not find that expense — can you point me to it?"),
         ]
     )
     graph = build_graph(model, checkpointer=InMemorySaver())
 
     events = await run_turn(graph, member, "change the other one")
 
-    kinds = [k for k, _ in events]
-    assert "needs_confirmation" not in kinds and kinds[-1] == "done"
-    assert "re-read" in model.last_prompt[-1].content.lower()
+    (request,) = events[-1][1]["action_requests"]
+    assert "EXP-999 (not in what you've read)" in request["description"]
+
+
+@respx.mock
+async def test_reads_in_a_write_message_run_while_the_writes_wait(member):
+    """ADR 0010 dropped the mixed-message bounce: reads run, writes pause."""
+    reads = _stub_get_expenses([EXPENSE_ROW])
+    model = ScriptedChatModel(
+        responses=[
+            multi_call(
+                ("get_expenses", {"month": 3, "year": 2026}),
+                ("create_expense", {"amount": 2}),
+            ),
+        ]
+    )
+    graph = build_graph(model, checkpointer=InMemorySaver())
+
+    events = await run_turn(graph, member, "read and add")
+
+    assert events[-1][0] == "needs_confirmation"
+    assert [r["name"] for r in events[-1][1]["action_requests"]] == ["create_expense"]
+    assert not reads.called  # runs only once the card is decided
 
 
 # --- resuming ----------------------------------------------------------
 
 
 @respx.mock
-async def test_confirm_applies_the_selected_actions(member):
+async def test_approve_runs_the_write(member):
     _stub_get_expenses([EXPENSE_ROW])
     update = respx.post(method_url(f"{API}.update_expense")).mock(
         return_value=httpx.Response(200, json={"message": {"name": "EXP-17"}})
@@ -140,18 +176,40 @@ async def test_confirm_applies_the_selected_actions(member):
     graph = build_graph(model, checkpointer=InMemorySaver())
     await run_turn(graph, member, "bump the coffee to 6")
 
-    events = await _resume(graph, member, {"selected": ["w0"]})
+    events = await _resume(graph, member, {"decisions": [approve()]})
 
     assert update.called
     body = json.loads(update.calls.last.request.read())
     assert body["amount"] == 6.0
-    assert body["if_modified_since"] == MODIFIED
     kinds = [k for k, _ in events]
     assert "token" in kinds and kinds[-1] == "done"
 
 
 @respx.mock
-async def test_confirmed_create_stamps_entry_method_assistant(member):
+async def test_the_stale_write_guard_is_only_what_the_model_passes(member):
+    """Known issue (ADR 0010, expenso-assistant#9): the service no longer injects the row's
+    `modified` value. The guard holds only if the model passes it."""
+    _stub_get_expenses([EXPENSE_ROW])
+    update = respx.post(method_url(f"{API}.update_expense")).mock(
+        return_value=httpx.Response(200, json={"message": {"name": "EXP-17"}})
+    )
+    model = ScriptedChatModel(
+        responses=[
+            tool_call("get_expenses", month=3, year=2026),
+            multi_call(("update_expense", {"name": "EXP-17", "amount": 6.0})),
+            answer("Updated."),
+        ]
+    )
+    graph = build_graph(model, checkpointer=InMemorySaver())
+    await run_turn(graph, member, "bump the coffee to 6")
+
+    await _resume(graph, member, {"decisions": [approve()]})
+
+    assert json.loads(update.calls.last.request.read()).get("if_modified_since") is None
+
+
+@respx.mock
+async def test_approved_create_stamps_entry_method_assistant(member):
     create = respx.post(method_url(f"{API}.create_expense")).mock(
         return_value=httpx.Response(200, json={"message": {"name": "EXP-99"}})
     )
@@ -164,7 +222,7 @@ async def test_confirmed_create_stamps_entry_method_assistant(member):
     graph = build_graph(model, checkpointer=InMemorySaver())
     await run_turn(graph, member, "add a 12 groceries expense")
 
-    await _resume(graph, member, {"selected": ["w0"]})
+    await _resume(graph, member, {"decisions": [approve()]})
 
     body = json.loads(create.calls.last.request.read())
     assert body["entry_method"] == "assistant"
@@ -172,7 +230,7 @@ async def test_confirmed_create_stamps_entry_method_assistant(member):
 
 
 @respx.mock
-async def test_deselecting_an_action_writes_only_the_rest(member):
+async def test_rejecting_one_action_writes_only_the_rest(member):
     _stub_get_expenses([EXPENSE_ROW, {**EXPENSE_ROW, "name": "EXP-18"}])
     update = respx.post(method_url(f"{API}.update_expense")).mock(
         return_value=httpx.Response(200, json={"message": {"name": "x"}})
@@ -190,14 +248,16 @@ async def test_deselecting_an_action_writes_only_the_rest(member):
     graph = build_graph(model, checkpointer=InMemorySaver())
     await run_turn(graph, member, "bump both")
 
-    await _resume(graph, member, {"selected": ["w0"]})
+    await _resume(graph, member, {"decisions": [approve(), reject()]})
 
     assert update.call_count == 1
     assert json.loads(update.calls.last.request.read())["name"] == "EXP-17"
+    rejected = next(m for m in model.last_prompt if getattr(m, "tool_call_id", None) == "w1")
+    assert "rejected" in rejected.content.lower()
 
 
 @respx.mock
-async def test_cancel_writes_nothing(member):
+async def test_rejecting_everything_writes_nothing(member):
     _stub_get_expenses([EXPENSE_ROW])
     update = respx.post(method_url(f"{API}.update_expense")).mock(
         return_value=httpx.Response(200, json={"message": {}})
@@ -212,14 +272,39 @@ async def test_cancel_writes_nothing(member):
     graph = build_graph(model, checkpointer=InMemorySaver())
     await run_turn(graph, member, "bump the coffee")
 
-    events = await _resume(graph, member, {"selected": []})
+    events = await _resume(graph, member, {"decisions": [reject()]})
 
     assert not update.called
     assert events[-1][0] == "done"
 
 
 @respx.mock
-async def test_a_per_action_conflict_does_not_abort_the_batch(member):
+async def test_an_edit_runs_the_edited_args_and_tells_the_model(member):
+    create = respx.post(method_url(f"{API}.create_expense")).mock(
+        return_value=httpx.Response(200, json={"message": {"name": "EXP-99"}})
+    )
+    model = ScriptedChatModel(
+        responses=[
+            multi_call(("create_expense", {"amount": 12, "category": "Groceries"})),
+            answer("Added it."),
+        ]
+    )
+    graph = build_graph(model, checkpointer=InMemorySaver())
+    await run_turn(graph, member, "add 12 groceries")
+
+    await _resume(
+        graph,
+        member,
+        {"decisions": [edit("create_expense", {"amount": 15, "category": "Groceries"})]},
+    )
+
+    assert json.loads(create.calls.last.request.read())["amount"] == 15
+    result = next(m for m in model.last_prompt if isinstance(m, ToolMessage))
+    assert '"amount": 15' in result.content  # the model is told what actually ran
+
+
+@respx.mock
+async def test_a_frappe_conflict_on_one_write_does_not_stop_the_others(member):
     _stub_get_expenses([EXPENSE_ROW, {**EXPENSE_ROW, "name": "EXP-18"}])
 
     def update_side_effect(request: httpx.Request) -> httpx.Response:
@@ -244,74 +329,12 @@ async def test_a_per_action_conflict_does_not_abort_the_batch(member):
     graph = build_graph(model, checkpointer=InMemorySaver())
     await run_turn(graph, member, "bump both")
 
-    events = await _resume(graph, member, {"selected": ["w0", "w1"]})
+    events = await _resume(graph, member, {"decisions": [approve(), approve()]})
 
     assert update.call_count == 2  # both attempted
     assert events[-1][0] == "done"
-    assert "changed since you read it" in model.last_prompt[-1].content.lower()
-
-
-@respx.mock
-async def test_partial_confirm_tool_messages_are_row_specific(member):
-    coffee = {**EXPENSE_ROW, "name": "EXP-17", "amount": 5, "category_name": "Dining"}
-    carrot = {**EXPENSE_ROW, "name": "EXP-18", "amount": 10, "category_name": "Groceries"}
-    _stub_get_expenses([coffee, carrot])
-    respx.post(method_url(f"{API}.update_expense")).mock(
-        return_value=httpx.Response(200, json={"message": {"name": "EXP-18"}})
-    )
-    model = ScriptedChatModel(
-        responses=[
-            tool_call("get_expenses", month=3, year=2026),
-            multi_call(
-                ("update_expense", {"name": "EXP-17", "category": "Other"}),
-                ("update_expense", {"name": "EXP-18", "category": "Other"}),
-            ),
-            answer("Done."),
-        ]
-    )
-    graph = build_graph(model, checkpointer=InMemorySaver())
-    await run_turn(graph, member, "recategorize the coffee and carrot expenses to Other")
-
-    # Confirm only the carrot row (w1); skip the coffee row (w0).
-    await _resume(graph, member, {"selected": ["w1"]})
-
-    tool_messages = {
-        m.tool_call_id: m.content for m in model.last_prompt if isinstance(m, ToolMessage)
-    }
-    # expenso-assistant#5: each outcome must name its own row (Dining vs.
-    # Groceries) so the model isn't left to guess which is which from
-    # tool_call_id matching alone when it narrates the batch back.
-    assert "skipped" in tool_messages["w0"].lower()
-    assert "dining" in tool_messages["w0"].lower()
-    assert "updated" in tool_messages["w1"].lower()
-    assert "groceries" in tool_messages["w1"].lower()
-
-
-@respx.mock
-async def test_batch_cap_limits_the_card(member, monkeypatch):
-    monkeypatch.setenv("MAX_PROPOSED_WRITES_PER_TURN", "2")
-    get_settings.cache_clear()
-    create = respx.post(method_url(f"{API}.create_expense")).mock(
-        return_value=httpx.Response(200, json={"message": {"name": "x"}})
-    )
-    model = ScriptedChatModel(
-        responses=[
-            multi_call(
-                ("create_expense", {"amount": 1}),
-                ("create_expense", {"amount": 2}),
-                ("create_expense", {"amount": 3}),
-            ),
-            answer("Added two; one still to go."),
-        ]
-    )
-    graph = build_graph(model, checkpointer=InMemorySaver())
-
-    events = await run_turn(graph, member, "add three expenses")
-    assert len(events[-1][1]["actions"]) == 2
-
-    await _resume(graph, member, {"selected": ["w0", "w1"]})
-    assert create.call_count == 2
-    assert "next" in model.last_prompt[-1].content.lower()
+    conflict = next(m for m in model.last_prompt if getattr(m, "tool_call_id", None) == "w1")
+    assert "changed since you read it" in conflict.content.lower()
 
 
 # --- lifecycle -------------------------------------------------------
@@ -345,16 +368,46 @@ async def test_a_new_message_discards_the_pending_card(member):
     ]
 
 
+@respx.mock
+async def test_a_card_whose_paused_task_was_lost_is_still_discarded(member):
+    """A deploy that renames graph nodes (ADR 0010) drops the paused task but
+    keeps the unanswered write call in the thread. It must still be discarded,
+    or OpenAI rejects every later turn."""
+    _stub_get_expenses([EXPENSE_ROW])
+    model = ScriptedChatModel(
+        responses=[
+            tool_call("get_expenses", month=3, year=2026),
+            multi_call(("update_expense", {"name": "EXP-17", "amount": 6.0})),
+            answer("Okay, left it as is."),
+        ]
+    )
+    graph = build_graph(model, checkpointer=InMemorySaver())
+    await run_turn(graph, member, "bump the coffee")
+    config = {"configurable": {"thread_id": member.thread_id}}
+    await graph.aupdate_state(config, None, as_node=END)  # the lost task
+    assert await session.pending_card(graph, config) is None
+
+    events = await run_turn(graph, member, "never mind")
+
+    assert events[0] == ("step", {"text": "Discarded the unconfirmed changes"})
+    assert events[-1][0] == "done"
+    history = await session.history(graph, member, get_settings())
+    assert [m["content"] for m in history][-1] == "Okay, left it as is."
+
+
 async def test_resume_with_no_pending_card_is_clean(member):
     graph = build_graph(ScriptedChatModel(responses=[answer("hi")]), checkpointer=InMemorySaver())
 
-    events = await _resume(graph, member, {"selected": []})
+    events = await _resume(graph, member, {"decisions": []})
 
     assert events == [("error", {"code": "nothing_to_resume", "message": events[0][1]["message"]})]
 
 
 @respx.mock
-async def test_tool_call_count_persists_across_the_interrupt(member, monkeypatch):
+async def test_the_tool_call_cap_resets_on_the_resume_leg(member, monkeypatch):
+    """ADR 0010: the stock per-run cap resets when /resume starts a new run
+    (the old step count spanned the pause). Two calls before the card and
+    one after would trip a cap of 2 if it spanned the pause; it does not."""
     monkeypatch.setenv("RUN_MAX_TOOL_CALLS", "2")
     get_settings.cache_clear()
     _stub_get_expenses([EXPENSE_ROW])
@@ -363,17 +416,18 @@ async def test_tool_call_count_persists_across_the_interrupt(member, monkeypatch
     )
     model = ScriptedChatModel(
         responses=[
-            tool_call("get_expenses", month=3, year=2026),  # cycle 1 -> count 1
+            tool_call("get_expenses", month=3, year=2026),
             multi_call(("update_expense", {"name": "EXP-17", "amount": 6.0})),
-            answer("should never be reached"),
+            tool_call("get_expenses", month=3, year=2026),
+            answer("Updated, and it reads back as 6."),
         ]
     )
     graph = build_graph(model, checkpointer=InMemorySaver())
     await run_turn(graph, member, "bump it")
 
-    events = await _resume(graph, member, {"selected": ["w0"]})
+    events = await _resume(graph, member, {"decisions": [approve()]})
 
-    assert events[-1][0] == "error" and events[-1][1]["code"] == "tool_cap"
+    assert events[-1][0] == "done"
 
 
 @respx.mock
@@ -394,18 +448,18 @@ async def test_resume_opens_its_own_trace_and_skips_the_chat_cap(member, spy_lan
     await run_turn(graph, member, "bump it")
     fetches_after_chat = len(spy.fetch_calls)
 
-    await _resume(graph, member, {"selected": ["w0"]})
+    await _resume(graph, member, {"decisions": [approve()]})
 
     assert len(spy.fetch_calls) == fetches_after_chat  # no daily-cap check on resume
     chat_traces = [t for t in spy.traces if {"feature:chat"} <= set(t.init.get("tags", []))]
     assert len(chat_traces) == 2  # the turn + the resume leg
 
 
-# --- shapes -----------------------------------------------------------
+# --- card text --------------------------------------------------------
 
 
 @respx.mock
-async def test_set_budget_is_update_when_a_budget_row_is_in_history(member):
+async def test_set_budget_shows_the_current_amount_when_a_budget_row_was_read(member):
     respx.get(method_url(f"{API}.get_budgets")).mock(
         return_value=httpx.Response(
             200,
@@ -414,42 +468,29 @@ async def test_set_budget_is_update_when_a_budget_row_is_in_history(member):
             },
         )
     )
-    respx.post(method_url(f"{API}.set_budget")).mock(
-        return_value=httpx.Response(200, json={"message": {"name": "b1"}})
-    )
     model = ScriptedChatModel(
         responses=[
             tool_call("get_budgets", month=3, year=2026),
             multi_call(
                 ("set_budget", {"category": "Groceries", "month": 3, "year": 2026, "amount": 400})
             ),
-            answer("Budget set."),
         ]
     )
     graph = build_graph(model, checkpointer=InMemorySaver())
 
     events = await run_turn(graph, member, "raise the groceries budget to 400")
 
-    (action,) = events[-1][1]["actions"]
-    assert action["kind"] == "update"
-    assert {"field": "amount", "from": 300, "to": 400} in action["changes"]
+    (request,) = events[-1][1]["action_requests"]
+    assert request["description"] == "Budget — Groceries, 3/2026: amount 300 → 400"
 
 
 @respx.mock
-async def test_add_category_is_a_create_with_no_stale_guard(member):
-    respx.post(method_url(f"{API}.add_category")).mock(
-        return_value=httpx.Response(200, json={"message": {"name": "cat-new"}})
-    )
-    model = ScriptedChatModel(
-        responses=[
-            multi_call(("add_category", {"name": "Travel"})),
-            answer("Added the Travel category."),
-        ]
-    )
+async def test_add_category_reads_as_an_add(member):
+    model = ScriptedChatModel(responses=[multi_call(("add_category", {"name": "Travel"}))])
     graph = build_graph(model, checkpointer=InMemorySaver())
 
     events = await run_turn(graph, member, "add a travel category")
 
-    (action,) = events[-1][1]["actions"]
-    assert action["kind"] == "create" and action["entity"] == "category"
-    assert action["values"] == {"name": "Travel"}
+    (request,) = events[-1][1]["action_requests"]
+    assert request["description"] == "Add category 'Travel'"
+    assert request["args"] == {"name": "Travel"}

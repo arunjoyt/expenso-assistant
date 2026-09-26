@@ -150,6 +150,30 @@ def within_daily_token_cap(user_id: str) -> bool:
     return token_store().get(user_id, _local_today()) < cap
 
 
+# Receipt extraction accuracy (ADR 0003). A proposed `None` is excluded — there
+# was no claim to grade.
+_SCORED_FIELDS = ("amount", "date", "category", "notes")
+
+
+def score_receipt_accuracy(card: dict, decision: dict, trace: TurnTrace) -> None:
+    """The confirm-time correction signal (ADR 0003): per field, did what the
+    vision call proposed survive the member's review? Posted on the resume
+    leg's own trace (P7-S1), where the comparison happens. Reads the stock HITL
+    card and decisions (ADR 0010), which line up one-to-one; rejected rows are
+    not scored."""
+    requests = card.get("action_requests") or []
+    for request, choice in zip(requests, decision.get("decisions") or [], strict=False):
+        if request.get("name") != "create_expense" or choice.get("type") == "reject":
+            continue
+        proposed = request.get("args") or {}
+        confirmed = (choice.get("edited_action") or {}).get("args") or proposed
+        for field in _SCORED_FIELDS:
+            if proposed.get(field) is None:
+                continue
+            match = str(proposed[field]) == str(confirmed.get(field))
+            trace.score(f"receipt_accuracy_{field}", 1.0 if match else 0.0)
+
+
 def _local_midnight() -> datetime:
     now = datetime.now(ZoneInfo(get_settings().service_timezone))
     return now.replace(hour=0, minute=0, second=0, microsecond=0)

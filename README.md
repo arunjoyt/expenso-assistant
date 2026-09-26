@@ -28,7 +28,10 @@ src/expenso_assistant/
                     resolve_member() + the FastAPI dependency + thread-id derivation
   mcp_server.py     FastMCP adapter — registers tools.py, SEP-2322 confirm on writes, MCP_ENABLED-gated
   agent/
-    graph.py        hand-rolled agent<->tools StateGraph, binds tools.py directly (no MCP)
+    graph.py        create_agent + stock middleware (ADR 0010): cap, history editing, HITL confirm card
+    middleware.py   the one custom middleware: prompt, receipt image, proactive instruction
+    describe.py     confirm-card text per proposed write (from → to where the row was read)
+    state.py        checkpointed state + per-run RunContext
     model.py        build_model() — the one place OpenAI is named
     prompt.py       system prompt, today's date filled in per run
     observability.py Langfuse trace + explicit-cost callback + daily-cap query

@@ -8,7 +8,7 @@ from datetime import UTC, datetime
 import httpx
 import pytest
 import respx
-from langchain_core.messages import AIMessage
+from langchain_core.messages import AIMessage, ToolMessage
 from langgraph.checkpoint.memory import InMemorySaver
 
 from expenso_assistant.agent import session
@@ -134,23 +134,37 @@ async def test_a_turns_tokens_are_added_to_the_daily_total(member, spy_token_sto
     assert spy.added == [(member.email, 120)]
 
 
-async def test_old_turns_drop_from_what_the_model_sees_but_stay_in_history(member, monkeypatch):
-    """2026-09-11 update: the window is transient, not a checkpoint prune —
-    the model stops seeing the earliest turn once the thread outgrows the
-    budget, but `GET /history` (via `session.history`) still has it."""
-    monkeypatch.setenv("CHAT_HISTORY_TOKEN_BUDGET", "30")
+@respx.mock
+async def test_old_tool_outputs_leave_what_the_model_sees_but_stay_in_the_thread(
+    member, monkeypatch
+):
+    """ADR 0010: the stock `ContextEditingMiddleware` clears older tool
+    outputs from the model's view once the thread is over budget — a
+    transient edit, so the checkpointed thread keeps every result."""
+    monkeypatch.setenv("CHAT_HISTORY_TOKEN_BUDGET", "50")
     get_settings.cache_clear()
-    model = ScriptedChatModel(responses=[answer("ok")] * 4)
+    rows = [{"category_name": f"Category {i}", "budget_amount": i} for i in range(20)]
+    respx.get(method_url(f"{API}.get_budgets")).mock(
+        return_value=httpx.Response(200, json={"message": rows})
+    )
+    turns = 5
+    responses = []
+    for i in range(turns):
+        call = {"name": "get_budgets", "args": {"month": 3, "year": 2026}, "id": f"read_{i}"}
+        responses += [AIMessage(content="", tool_calls=[call]), answer(f"answer {i}")]
+    model = ScriptedChatModel(responses=responses)
     graph = build_graph(model, checkpointer=InMemorySaver())
 
-    for i in range(4):
-        await run_turn(graph, member, f"turn number {i} padded with some extra words")
+    for i in range(turns):
+        await run_turn(graph, member, f"turn {i}")
 
-    sent_texts = [m.content for m in model.last_prompt if isinstance(m.content, str)]
-    assert not any("turn number 0" in text for text in sent_texts)
-
-    full_history = await session.history(graph, member, get_settings())
-    assert any("turn number 0" in (entry.get("content") or "") for entry in full_history)
+    sent = {m.tool_call_id: m.content for m in model.last_prompt if isinstance(m, ToolMessage)}
+    assert sent["read_0"] == "[cleared]"
+    assert "Category 19" in sent[f"read_{turns - 1}"]
+    state = await graph.aget_state({"configurable": {"thread_id": member.thread_id}})
+    stored = [m for m in state.values["messages"] if isinstance(m, ToolMessage)]
+    assert len(stored) == turns
+    assert all("Category 19" in m.content for m in stored)
 
 
 async def test_wall_clock_cap_ends_in_error_with_no_partial_answer(member, monkeypatch):
