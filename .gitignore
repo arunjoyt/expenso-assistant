@@ -8,3 +8,4 @@ nginx/certs/
 docker-compose.override.yml
 dist/
 *.egg-info/
+.DS_Store
