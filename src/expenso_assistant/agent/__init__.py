@@ -9,6 +9,6 @@
 - `state.py` — checkpointed state and the per-run `RunContext`.
 - `model.py` — `build_model()`, the one place OpenAI is named.
 - `prompt.py` — the system prompt, today's date filled in per run.
-- `observability.py` — Langfuse trace + explicit-cost callback + daily-cap query.
+- `observability.py` — LangSmith tracer + image masking + daily token cap.
 - `session.py` — one chat turn: drive the graph, emit SSE, roll back on failure.
 """

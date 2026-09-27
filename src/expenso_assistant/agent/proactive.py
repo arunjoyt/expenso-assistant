@@ -113,38 +113,20 @@ async def _post_insight(
     # (P7-S2 grill: "the thread is linear").
     await discard_pending(graph, config)
 
-    trace = TurnTrace.start(
-        user_id=member.email,
-        session_id=member.thread_id,
-        user_input=instruction,
-        feature=FEATURE_INSIGHTS,
+    TurnTrace(user_id=member.email, session_id=member.thread_id, feature=FEATURE_INSIGHTS).apply(
+        config
     )
-    config["callbacks"] = [trace.callback]
 
     client_token = bind_frappe_client(FrappeClient(member.token))
     entry_token = tool_defs.bind_entry_method("assistant")
     try:
         inputs = {"messages": [], "entry_method": "assistant"}
-        result = await asyncio.wait_for(
+        await asyncio.wait_for(
             graph.ainvoke(inputs, config, context=context), timeout=settings.run_wall_clock_seconds
         )
-        trace.finish(output=_final_text(result))
-    except Exception:
-        trace.fail("internal")
-        raise
     finally:
         tool_defs.reset_entry_method(entry_token)
         reset_frappe_client(client_token)
-        _flush_trace()
-
-
-def _final_text(result: dict) -> str:
-    messages = result.get("messages") or []
-    for message in reversed(messages):
-        content = getattr(message, "content", None)
-        if isinstance(content, str) and content and not getattr(message, "tool_calls", None):
-            return content
-    return "[no insight]"
 
 
 def _today(settings: Settings):
@@ -153,12 +135,3 @@ def _today(settings: Settings):
 
 def _previous_month(today) -> tuple[int, int]:
     return (12, today.year - 1) if today.month == 1 else (today.month - 1, today.year)
-
-
-def _flush_trace() -> None:
-    from .observability import langfuse_client
-
-    try:
-        langfuse_client().flush()
-    except Exception as exc:
-        logger.warning("langfuse flush failed: %s", exc)

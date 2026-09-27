@@ -1,32 +1,23 @@
-"""Langfuse tracing, the token/cost callback, and the daily token cap.
+"""LangSmith tracing, receipt-accuracy feedback, and the daily token cap.
 
-ADR 0008: Langfuse is the *only* record of an LLM call. Every turn opens one
-trace tagged `user_id` / `metadata.feature` / `session_id` (no `family` — see the
-2026-09-10 P6-S5 update).
+ADR 0011 (supersedes ADR 0008's self-hosted Langfuse): every turn is one
+LangSmith trace, recorded by LangChain's stock `LangChainTracer`. The turn's
+root run carries `user_id` / `session_id` / `feature` as metadata and a
+`feature:<x>` tag; the tracer nests every model call, tool call, middleware
+step and confirm-card pause under it, and records errors and outputs itself.
+LangSmith prices each model call from its own model table.
 
-expenso-assistant#4 update (2026-09-13): ADR 0008 originally had this service
-compute cost from `config.MODEL_PRICING` and send it to Langfuse via
-`usage_details`/`cost_details`, deliberately never Langfuse's own model-price
-table. Live debugging proved that plan doesn't work on this self-hosted build
-(`langfuse/langfuse:2`, resolves to 2.95.11): the ingestion API accepts
-`usage_details`/`cost_details` (`201`, no error) but silently never persists
-them — generations showed `$0.00`/no tokens in the UI even though our code
-computed real numbers. Only the deprecated `usage` shape
-(`promptTokens`/`completionTokens`/`totalTokens`) actually reaches the UI, and
-once it does, Langfuse always prices it from its own catalog — our cost is not
-recoverable there. So `CostCallback` now sends real token counts via `usage`
-for a correct token badge, and no longer sends cost to Langfuse at all;
-`cost_for`/`MODEL_PRICING` (config.py) stay as this service's own tested cost
-math, just not forwarded anywhere. The daily cap was never affected by any of
-this — see `within_daily_token_cap` below.
+Traces go to hosted LangSmith (EU region by default), so family financial data
+leaves our infrastructure. Receipt images never do: `mask_images` replaces
+every image data URI in a run's inputs before upload. Amounts, categories,
+notes and member emails are sent as-is (ADR 0011).
 
-The stock `langfuse.callback.CallbackHandler` is deliberately not used: it drags
-in the full `langchain` meta-package.
+Tracing is off when `LANGSMITH_API_KEY` is empty. Do not also set
+`LANGSMITH_TRACING`: LangChain would then add a second, unmasked tracer.
 
-The daily cap (`within_daily_token_cap`) is the one exception to "Langfuse is
-the only record": it reads a same-day token total from a small Postgres
-counter, not from Langfuse (ADR 0008's 2026-09-11 update) — see
-`PostgresTokenStore`'s docstring for why that doesn't reopen the rule above.
+The daily cap (`within_daily_token_cap`) reads a same-day token total from a
+small Postgres counter, not from the tracing backend (ADR 0008's 2026-09-11
+update).
 """
 
 from __future__ import annotations
@@ -34,13 +25,16 @@ from __future__ import annotations
 import logging
 from datetime import date, datetime
 from typing import Any
+from uuid import UUID, uuid4
 from zoneinfo import ZoneInfo
 
 from langchain_core.callbacks import BaseCallbackHandler
+from langchain_core.messages import BaseMessage
 from langchain_core.outputs import LLMResult
-from langfuse import Langfuse
+from langchain_core.tracers import LangChainTracer
+from langsmith import Client
 
-from ..config import cost_for, get_settings
+from ..config import get_settings
 
 logger = logging.getLogger(__name__)
 
@@ -53,25 +47,67 @@ FEATURE_RECEIPT = "receipt"
 # surface.
 FEATURE_INSIGHTS = "insights"
 
-_client: Langfuse | None = None
+IMAGE_PLACEHOLDER = "[receipt image removed]"
+
+_client: Client | None = None
 
 
-def langfuse_client() -> Langfuse:
+def langsmith_client() -> Client | None:
+    """The shared LangSmith client, or None when tracing is off."""
     global _client
-    if _client is None:
-        s = get_settings()
-        _client = Langfuse(
-            public_key=s.langfuse_public_key,
-            secret_key=s.langfuse_secret_key,
-            host=s.langfuse_host,
+    settings = get_settings()
+    if _client is None and settings.langsmith_api_key:
+        _client = Client(
+            api_url=settings.langsmith_endpoint,
+            api_key=settings.langsmith_api_key,
+            hide_inputs=mask_images,
         )
     return _client
 
 
-def reset_langfuse_client() -> None:
+def reset_langsmith_client() -> None:
     """Drop the cached client — tests and a settings reload call this."""
     global _client
     _client = None
+
+
+def tracers() -> list[BaseCallbackHandler]:
+    """The stock LangSmith tracer for one run, or none when tracing is off."""
+    client = langsmith_client()
+    if client is None:
+        return []
+    return [LangChainTracer(client=client, project_name=get_settings().langsmith_project)]
+
+
+def flush_traces() -> None:
+    """Send what the client still holds. The app calls this at shutdown."""
+    client = langsmith_client()
+    if client is None:
+        return
+    try:
+        client.flush()
+    except Exception as exc:
+        logger.warning("langsmith flush failed: %s", exc)
+
+
+def mask_images(inputs: dict) -> dict:
+    """The client's `hide_inputs` hook: a receipt reaches the model as a
+    `data:image/...;base64,` URI (P7-S1), and never reaches LangSmith. Model
+    runs record messages as dicts; middleware runs record the live message
+    objects of the model request, so both are walked."""
+    return _mask(inputs)
+
+
+def _mask(value: Any) -> Any:
+    if isinstance(value, str):
+        return IMAGE_PLACEHOLDER if value.startswith("data:image/") else value
+    if isinstance(value, BaseMessage):
+        return value.model_copy(update={"content": _mask(value.content)})
+    if isinstance(value, dict):
+        return {key: _mask(item) for key, item in value.items()}
+    if isinstance(value, list | tuple):
+        return [_mask(item) for item in value]
+    return value
 
 
 # --- daily cap -------------------------------------------------------------
@@ -81,8 +117,7 @@ class PostgresTokenStore:
     """The daily per-Member token total backing `within_daily_token_cap`
     (ADR 0008's 2026-09-11 update, replacing the turn-count `daily_chat_cap`).
     A same-day, increment-only numeric aggregate with no per-call detail —
-    not a record of an LLM call, so this does not reopen this module's
-    "Langfuse is the *only* record" rule above. Lives as a table in the
+    not a record of an LLM call; the trace stays that record. Lives as a table in the
     LangGraph checkpointer's own Postgres (`config.database_url`), not a new
     datastore."""
 
@@ -183,73 +218,59 @@ def _local_today() -> date:
     return _local_midnight().date()
 
 
-# --- per-turn trace + cost ------------------------------------------------
+# --- per-turn trace + token count ------------------------------------------
 
 
 class TurnTrace:
-    """One Langfuse trace for one chat turn, plus the callback that records each
-    generation's cost explicitly."""
+    """One LangSmith trace for one turn. `apply` puts the root run's id, name,
+    tags and metadata on the run config, next to the tracer and the daily
+    token counter."""
 
-    def __init__(self, trace: Any, model: str, user_id: str):
-        self._trace = trace
-        self.callback = CostCallback(trace, model, user_id)
-
-    @classmethod
-    def start(
-        cls, *, user_id: str, session_id: str, user_input: str, feature: str = FEATURE_CHAT
-    ) -> TurnTrace:
-        trace = langfuse_client().trace(
-            name="chat-turn",
-            user_id=user_id,
-            session_id=session_id,
-            input=user_input,
-            tags=[f"feature:{feature}"],
-            metadata={"feature": feature},
-        )
-        return cls(trace, get_settings().openai_model, user_id)
-
-    @property
-    def total_cost(self) -> float:
-        return self.callback.total_cost
-
-    def finish(self, *, output: str) -> None:
-        self._trace.update(output=output)
-
-    def fail(self, code: str) -> None:
-        self._trace.update(level="ERROR", status_message=code)
-
-    def score(self, name: str, value: float) -> None:
-        self._trace.score(name=name, value=value)
-
-
-class CostCallback(BaseCallbackHandler):
-    def __init__(self, trace: Any, model: str, user_id: str):
-        self._trace = trace
-        self._model = model
+    def __init__(self, *, user_id: str, session_id: str, feature: str = FEATURE_CHAT):
+        self.run_id: UUID = uuid4()
         self._user_id = user_id
-        self.total_cost = 0.0
+        self._session_id = session_id
+        self._feature = feature
+
+    def apply(self, config: dict) -> dict:
+        config.update(
+            run_id=self.run_id,
+            run_name=f"{self._feature}-turn",
+            tags=[f"feature:{self._feature}"],
+            # `session_id` groups a Member's turns into one LangSmith thread.
+            metadata={
+                "feature": self._feature,
+                "user_id": self._user_id,
+                "session_id": self._session_id,
+            },
+            callbacks=[*tracers(), TokenCounter(self._user_id)],
+        )
+        return config
+
+    def score(self, key: str, value: float) -> None:
+        """Feedback on this trace. `trace_id` lets the client batch it with the
+        runs, so it may be sent before the run itself has ended."""
+        client = langsmith_client()
+        if client is None:
+            return
+        try:
+            client.create_feedback(trace_id=self.run_id, key=key, score=value)
+        except Exception as exc:
+            logger.warning("langsmith feedback %s failed: %s", key, exc)
+
+
+class TokenCounter(BaseCallbackHandler):
+    """Adds each model call's tokens to the Member's daily total."""
+
+    def __init__(self, user_id: str):
+        self._user_id = user_id
 
     def on_llm_end(self, response: LLMResult, **_: Any) -> None:
         usage = _usage_from_result(response)
-        self.total_cost += cost_for(self._model, **usage) or 0.0
-        self._trace.generation(
-            name="chat-completion",
-            model=self._model,
-            output=_text_from_result(response),
-            # Legacy shape, not usage_details/cost_details — see the module
-            # docstring (expenso-assistant#4). Langfuse prices this from its
-            # own catalog; this service's own cost_for() result above is kept
-            # for local bookkeeping only, not sent here.
-            usage={
-                "promptTokens": usage["input_tokens"],
-                "completionTokens": usage["output_tokens"],
-                "totalTokens": usage["input_tokens"] + usage["output_tokens"],
-            },
-        )
         # Best-effort bookkeeping, unlike the gate in `within_daily_token_cap`:
         # the call already happened and the cost is already incurred, so a
         # failure here is logged and swallowed rather than failing the turn
-        # after the fact (same trade-off as `_flush_trace`'s Langfuse flush).
+        # after the fact.
         try:
             token_store().add(
                 self._user_id, _local_today(), usage["input_tokens"] + usage["output_tokens"]
@@ -267,22 +288,14 @@ def _usage_from_result(response: LLMResult) -> dict[str, int]:
     usage = {
         "input_tokens": meta.get("input_tokens", 0),
         "output_tokens": meta.get("output_tokens", 0),
-        "cached_tokens": (meta.get("input_token_details") or {}).get("cache_read", 0),
-        "reasoning_tokens": (meta.get("output_token_details") or {}).get("reasoning", 0),
     }
     if not usage["input_tokens"] and not usage["output_tokens"]:
         usage = {
             "input_tokens": token_usage.get("prompt_tokens", 0),
             "output_tokens": token_usage.get("completion_tokens", 0),
-            "cached_tokens": (token_usage.get("prompt_tokens_details") or {}).get(
-                "cached_tokens", 0
-            ),
-            "reasoning_tokens": (token_usage.get("completion_tokens_details") or {}).get(
-                "reasoning_tokens", 0
-            ),
         }
     if not usage["input_tokens"] and not usage["output_tokens"]:
-        # expenso-assistant#4: a live trace comparison found $0.00/empty usage on
+        # expenso-assistant#4: a live trace comparison found empty usage on
         # generations that end in a tool call with no final text. The original
         # version of this warning only fired when `usage_metadata` was entirely
         # absent — a live recurrence showed it comes back as a non-empty dict
@@ -300,8 +313,3 @@ def _usage_from_result(response: LLMResult) -> dict[str, int]:
             getattr(message, "response_metadata", None),
         )
     return usage
-
-
-def _text_from_result(response: LLMResult) -> str:
-    generation = response.generations[0][0]
-    return getattr(generation, "text", "") or ""

@@ -25,14 +25,14 @@ from .fakes import ScriptedChatModel
 from .test_agent_session import answer, collect, run_turn
 from .test_agent_writes import multi_call
 
-pytestmark = pytest.mark.usefixtures("spy_langfuse_default")
+pytestmark = pytest.mark.usefixtures("spy_tracing_default")
 
 IMAGE = "data:image/jpeg;base64,Zm9vYmFy"
 
 
 @pytest.fixture
-def spy_langfuse_default(spy_langfuse):
-    return spy_langfuse()
+def spy_tracing_default(spy_tracing):
+    return spy_tracing()
 
 
 def _edit(args: dict) -> dict:
@@ -48,8 +48,8 @@ async def _resume(graph, member, decision) -> list[tuple[str, dict]]:
 # --- input shape drives tagging ------------------------------------------
 
 
-async def test_image_attached_binds_receipt_entry_method_and_feature(member, spy_langfuse):
-    spy = spy_langfuse()
+async def test_image_attached_binds_receipt_entry_method_and_feature(member, spy_tracing):
+    spy = spy_tracing()
     model = ScriptedChatModel(
         responses=[multi_call(("create_expense", {"amount": 12, "category": "Groceries"}))]
     )
@@ -57,20 +57,20 @@ async def test_image_attached_binds_receipt_entry_method_and_feature(member, spy
 
     events = await run_turn(graph, member, "", image=IMAGE)
 
-    assert spy.traces[0].init["metadata"]["feature"] == "receipt"
-    assert "feature:receipt" in spy.traces[0].init["tags"]
+    assert spy.recorded[0].extra["metadata"]["feature"] == "receipt"
+    assert "feature:receipt" in spy.recorded[0].tags
     (request,) = events[-1][1]["action_requests"]
     assert request["name"] == "create_expense"  # entry_method is internal, not on the card
 
 
-async def test_non_image_turn_still_tags_chat(member, spy_langfuse):
-    spy = spy_langfuse()
+async def test_non_image_turn_still_tags_chat(member, spy_tracing):
+    spy = spy_tracing()
     model = ScriptedChatModel(responses=[answer("hi")])
     graph = build_graph(model, checkpointer=InMemorySaver())
 
     await run_turn(graph, member, "hello")
 
-    assert spy.traces[0].init["metadata"]["feature"] == "chat"
+    assert spy.recorded[0].extra["metadata"]["feature"] == "chat"
 
 
 async def test_reading_receipt_step_precedes_everything(member):
@@ -170,8 +170,8 @@ async def test_confirmed_receipt_create_stamps_entry_method_receipt(member):
 
 
 @respx.mock
-async def test_unedited_confirm_scores_full_agreement_on_the_resume_trace(member, spy_langfuse):
-    spy = spy_langfuse()
+async def test_unedited_confirm_scores_full_agreement_on_the_resume_trace(member, spy_tracing):
+    spy = spy_tracing()
     respx.post(method_url(f"{API}.create_expense")).mock(
         return_value=httpx.Response(200, json={"message": {"name": "EXP-99"}})
     )
@@ -188,12 +188,12 @@ async def test_unedited_confirm_scores_full_agreement_on_the_resume_trace(member
     )
     graph = build_graph(model, checkpointer=InMemorySaver())
     await run_turn(graph, member, "", image=IMAGE)
-    traces_before_resume = list(spy.traces)
+    traces_before_resume = list(spy.recorded)
 
     await _resume(graph, member, {"decisions": [{"type": "approve"}]})
 
-    resume_trace = next(t for t in spy.traces if t not in traces_before_resume)
-    scores = {s["name"]: s["value"] for s in resume_trace.scores}
+    resume_trace = next(t for t in spy.recorded if t not in traces_before_resume)
+    scores = spy.scores(resume_trace)
     assert scores == {
         "receipt_accuracy_amount": 1.0,
         "receipt_accuracy_date": 1.0,
@@ -201,12 +201,12 @@ async def test_unedited_confirm_scores_full_agreement_on_the_resume_trace(member
         "receipt_accuracy_notes": 1.0,
     }
     # the trace that ran the vision call gets none of these
-    assert traces_before_resume[0].scores == []
+    assert spy.scores(traces_before_resume[0]) == {}
 
 
 @respx.mock
-async def test_edited_amount_scores_zero_only_on_that_field(member, spy_langfuse):
-    spy = spy_langfuse()
+async def test_edited_amount_scores_zero_only_on_that_field(member, spy_tracing):
+    spy = spy_tracing()
     respx.post(method_url(f"{API}.create_expense")).mock(
         return_value=httpx.Response(200, json={"message": {"name": "EXP-99"}})
     )
@@ -221,7 +221,7 @@ async def test_edited_amount_scores_zero_only_on_that_field(member, spy_langfuse
 
     await _resume(graph, member, {"decisions": [_edit({"amount": 15, "category": "Groceries"})]})
 
-    scores = {s["name"]: s["value"] for s in spy.traces[-1].scores}
+    scores = spy.scores(spy.recorded[-1])
     assert scores["receipt_accuracy_amount"] == 0.0
     assert scores["receipt_accuracy_category"] == 1.0
 
@@ -246,8 +246,8 @@ async def test_edited_value_is_what_actually_gets_saved(member):
     assert body["amount"] == 15
 
 
-async def test_rejected_proposal_scores_nothing(member, spy_langfuse):
-    spy = spy_langfuse()
+async def test_rejected_proposal_scores_nothing(member, spy_tracing):
+    spy = spy_tracing()
     model = ScriptedChatModel(
         responses=[
             multi_call(("create_expense", {"amount": 12, "category": "Groceries"})),
@@ -259,12 +259,12 @@ async def test_rejected_proposal_scores_nothing(member, spy_langfuse):
 
     await _resume(graph, member, {"decisions": [{"type": "reject"}]})
 
-    assert all(t.scores == [] for t in spy.traces)
+    assert spy.feedback == []
 
 
 @respx.mock
-async def test_null_proposed_field_is_excluded_from_scoring(member, spy_langfuse):
-    spy = spy_langfuse()
+async def test_null_proposed_field_is_excluded_from_scoring(member, spy_tracing):
+    spy = spy_tracing()
     respx.post(method_url(f"{API}.create_expense")).mock(
         return_value=httpx.Response(200, json={"message": {"name": "EXP-99"}})
     )
@@ -279,15 +279,14 @@ async def test_null_proposed_field_is_excluded_from_scoring(member, spy_langfuse
 
     await _resume(graph, member, {"decisions": [{"type": "approve"}]})
 
-    scores = {s["name"] for s in spy.traces[-1].scores}
-    assert scores == {"receipt_accuracy_amount"}
+    assert set(spy.scores(spy.recorded[-1])) == {"receipt_accuracy_amount"}
 
 
 @respx.mock
-async def test_non_receipt_write_is_never_scored(member, spy_langfuse):
+async def test_non_receipt_write_is_never_scored(member, spy_tracing):
     """A plain (non-image) 'add this expense' create is entry_method=assistant
     — even if edited at resume, it must never get receipt_accuracy_* scores."""
-    spy = spy_langfuse()
+    spy = spy_tracing()
     respx.post(method_url(f"{API}.create_expense")).mock(
         return_value=httpx.Response(200, json={"message": {"name": "EXP-99"}})
     )
@@ -302,7 +301,7 @@ async def test_non_receipt_write_is_never_scored(member, spy_langfuse):
 
     await _resume(graph, member, {"decisions": [_edit({"amount": 25, "category": "Coffee"})]})
 
-    assert all(t.scores == [] for t in spy.traces)
+    assert spy.feedback == []
 
 
 async def test_non_receipt_photo_asks_instead_of_proposing(member):

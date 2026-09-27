@@ -1,58 +1,10 @@
-"""Service configuration and the coupled model/pricing constant.
-
-v1 ships on one OpenAI model; its id and its price live together here as a
-hardcoded constant (ADR 0008). The OpenAI API returns token counts, not a
-dollar figure — the service computes cost from this table and attaches it
-explicitly to every Langfuse generation (P6-S5). A model swap is one reviewed
-commit to `MODEL_PRICING`.
-"""
+"""Service configuration."""
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 from functools import lru_cache
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
-
-
-@dataclass(frozen=True)
-class ModelRate:
-    """USD per 1,000,000 tokens."""
-
-    input: float
-    cached_input: float
-    output: float
-
-
-MODEL_PRICING: dict[str, ModelRate] = {
-    "gpt-4o-mini": ModelRate(input=0.15, cached_input=0.075, output=0.60),
-    "gpt-4o": ModelRate(input=2.50, cached_input=1.25, output=10.00),
-}
-
-
-def cost_for(
-    model: str,
-    *,
-    input_tokens: int,
-    output_tokens: int,
-    cached_tokens: int = 0,
-    reasoning_tokens: int = 0,
-) -> float | None:
-    """Dollar cost of one generation, or None for an unpriced model.
-
-    Cached input is billed at its discounted rate; reasoning tokens bill as
-    output (ADR 0008's 2026-09-10 update).
-    """
-    rate = MODEL_PRICING.get(model)
-    if rate is None:
-        return None
-    uncached_input = max(input_tokens - cached_tokens, 0)
-    total = (
-        uncached_input * rate.input
-        + cached_tokens * rate.cached_input
-        + (output_tokens + reasoning_tokens) * rate.output
-    )
-    return total / 1_000_000
 
 
 class Settings(BaseSettings):
@@ -87,12 +39,13 @@ class Settings(BaseSettings):
     def cors_origins(self) -> list[str]:
         return [origin.strip() for origin in self.allowed_cors_origins.split(",") if origin.strip()]
 
-    # Observability (P6-S5) — self-hosted Langfuse v2, loopback only in prod.
-    langfuse_public_key: str = ""
-    langfuse_secret_key: str = ""
-    langfuse_host: str = "http://localhost:3000"
+    # Tracing (ADR 0011) — hosted LangSmith, EU region. Empty key turns
+    # tracing off. Receipt images are masked before upload.
+    langsmith_api_key: str = ""
+    langsmith_endpoint: str = "https://eu.api.smith.langchain.com"
+    langsmith_project: str = "expenso-assistant"
 
-    # LangGraph checkpointer + Langfuse share this Postgres (P6-S5).
+    # LangGraph checkpointer (P6-S5) and the daily token counter.
     database_url: str = "postgresql://postgres:postgres@localhost:5432/assistant"
 
     # "Today" for the daily caps and the agent's date reasoning. The Family's
@@ -111,7 +64,7 @@ class Settings(BaseSettings):
     run_wall_clock_seconds: int = 90
 
     # Per-Member daily token cap — input+output tokens across chat/receipt
-    # turns, counted from a local Postgres total rather than Langfuse. No
+    # turns, counted from a local Postgres total rather than the traces. No
     # fail-open: the counter lives in the checkpointer's own Postgres, already
     # a hard dependency for a turn to run at all (ADR 0008's 2026-09-11 update
     # — replaces the old turn-count `daily_chat_cap`).

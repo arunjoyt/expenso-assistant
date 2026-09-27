@@ -86,7 +86,7 @@ class AuthedMember:
 
 def thread_id_for(email: str) -> str:
     """One opaque, stable thread id per Member. Opaque so it is not PII in
-    Langfuse / Postgres keys; derived, so the client cannot name someone
+    trace metadata / Postgres keys; derived, so the client cannot name someone
     else's thread."""
     return "member:" + hashlib.sha256(email.strip().lower().encode()).hexdigest()
 

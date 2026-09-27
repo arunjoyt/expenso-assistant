@@ -13,7 +13,7 @@ P7-S1).
 | Streak | State |
 |--------|-------|
 | P6-S3 — scaffold + `tools.py` + FastMCP adapter + PKCE auth | done |
-| P6-S5 — LangGraph agent (read-only) + SSE/`/resume` + Langfuse | done |
+| P6-S5 — LangGraph agent (read-only) + SSE/`/resume` + tracing (LangSmith since ADR 0011) | done |
 | P6-S7 — agent writes + confirm-card flow | not started |
 | P7-S1 — receipts (multimodal) | not started |
 
@@ -34,7 +34,7 @@ src/expenso_assistant/
     state.py        checkpointed state + per-run RunContext
     model.py        build_model() — the one place OpenAI is named
     prompt.py       system prompt, today's date filled in per run
-    observability.py Langfuse trace + explicit-cost callback + daily-cap query
+    observability.py LangSmith tracer + image masking + daily token cap
     session.py      one chat turn: drive the graph, emit SSE, roll back on failure
   api/main.py       FastAPI: /health, /chat (SSE), /resume, /history, /mcp mount
 ```
@@ -43,7 +43,7 @@ src/expenso_assistant/
 
 ```bash
 uv sync --extra dev
-uv run pytest          # no Postgres / OpenAI / Langfuse needed — all faked
+uv run pytest          # no Postgres / OpenAI / LangSmith needed — all faked
 uv run ruff check .
 
 # run the service against a local Frappe bench

@@ -20,21 +20,22 @@ def _settings(monkeypatch):
 
 
 @pytest.fixture
-def spy_langfuse(monkeypatch):
-    """Replace the Langfuse client with a recording spy. Returns a factory so a
-    test can set the trace count / a fetch error before the first use."""
+def spy_tracing(monkeypatch):
+    """Replace the LangSmith client and tracer with a recording spy. Returns a
+    factory, like the other spies."""
     from expenso_assistant.agent import observability
 
-    from .fakes import SpyLangfuse
+    from .fakes import SpyLangSmith
 
-    def install(**kwargs) -> SpyLangfuse:
-        spy = SpyLangfuse(**kwargs)
+    def install() -> SpyLangSmith:
+        spy = SpyLangSmith()
         monkeypatch.setattr(observability, "_client", spy)
+        monkeypatch.setattr(observability, "tracers", lambda: [spy.tracer()])
         return spy
 
-    observability.reset_langfuse_client()
+    observability.reset_langsmith_client()
     yield install
-    observability.reset_langfuse_client()
+    observability.reset_langsmith_client()
 
 
 @pytest.fixture
@@ -59,7 +60,7 @@ def spy_token_store(monkeypatch):
 @pytest.fixture(autouse=True)
 def _default_token_store(spy_token_store):
     """Most tests just need a store that reports 'under the cap' — mirrors
-    `spy_langfuse_default` per-file fixtures but applies everywhere, since
+    `spy_tracing_default` per-file fixtures but applies everywhere, since
     every turn now touches the token store, not just cap-focused tests."""
     return spy_token_store()
 

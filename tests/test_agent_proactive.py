@@ -19,12 +19,12 @@ from .fakes import ScriptedChatModel
 from .test_agent_session import answer, run_turn, tool_call
 from .test_agent_writes import multi_call
 
-pytestmark = pytest.mark.usefixtures("spy_langfuse_default")
+pytestmark = pytest.mark.usefixtures("spy_tracing_default")
 
 
 @pytest.fixture
-def spy_langfuse_default(spy_langfuse):
-    return spy_langfuse()
+def spy_tracing_default(spy_tracing):
+    return spy_tracing()
 
 
 def _config(member) -> dict:

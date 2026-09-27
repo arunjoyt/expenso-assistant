@@ -1,6 +1,6 @@
 #!/bin/bash
 # Create every database listed in POSTGRES_MULTIPLE_DATABASES (comma-separated).
-# The checkpointer uses `assistant`; Langfuse uses `langfuse`.
+# The checkpointer and the daily token counter use `assistant`.
 set -euo pipefail
 
 if [ -n "${POSTGRES_MULTIPLE_DATABASES:-}" ]; then

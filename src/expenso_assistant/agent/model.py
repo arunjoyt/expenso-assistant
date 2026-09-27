@@ -1,8 +1,9 @@
 """The one place the concrete LLM provider is named.
 
 ADR 0008 keeps LangChain's model abstraction as cheap provider-swap insurance,
-not a runtime switch: v1 is OpenAI, and a swap is this function plus the
-matching `config.MODEL_PRICING` row in one reviewed commit.
+not a runtime switch: v1 is OpenAI, and a swap is this function in one
+reviewed commit. LangSmith prices each call from its own model table
+(ADR 0011).
 """
 
 from __future__ import annotations

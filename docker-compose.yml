@@ -1,6 +1,6 @@
 # expenso-assistant stack — co-located on the Frappe VPS (ADR 0008, DEPLOYMENT.md).
 # One app process (FastAPI + agent + optional FastMCP adapter), one Postgres
-# shared by the LangGraph checkpointer and Langfuse, Langfuse v2, and nginx as
+# for the LangGraph checkpointer and the daily token counter, and nginx as
 # an internal SSE-aware proxy in front of `app`. The Frappe bench's own Traefik
 # (frappe_docker's overrides/compose.https.yaml) already owns host ports 80/443
 # for the 3 existing sites, so nginx here does NOT publish host ports — it
@@ -12,8 +12,7 @@
 # HTTP->HTTPS redirect is global on Traefik's `web` entrypoint, so only one
 # router (on `websecure`) is needed per site. See vps-ref-contabo's
 # RUNBOOK.md ("Fronting expenso-assistant through the existing Traefik").
-# The Langfuse UI is never exposed — loopback only, browsed over an SSH
-# tunnel.
+# Traces go to hosted LangSmith (ADR 0011) — nothing to run here.
 
 services:
   app:
@@ -22,7 +21,6 @@ services:
     env_file: .env
     environment:
       DATABASE_URL: postgresql://postgres:${POSTGRES_PASSWORD:-postgres}@postgres:5432/assistant
-      LANGFUSE_HOST: http://langfuse:3000
       # Derived from ASSISTANT_HOSTNAME (the single source of truth, also used
       # bare by nginx's Traefik router label below) rather than kept as its
       # own .env entry — Compose can concatenate a scheme onto a hostname but
@@ -46,8 +44,7 @@ services:
     environment:
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
-      # Langfuse gets its own DB; the checkpointer uses `assistant`.
-      POSTGRES_MULTIPLE_DATABASES: assistant,langfuse
+      POSTGRES_MULTIPLE_DATABASES: assistant
     volumes:
       - pgdata:/var/lib/postgresql/data
       - ./postgres/init-multiple-dbs.sh:/docker-entrypoint-initdb.d/init-multiple-dbs.sh:ro
@@ -56,22 +53,6 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
-
-  langfuse:
-    image: langfuse/langfuse:2
-    restart: unless-stopped
-    depends_on:
-      postgres:
-        condition: service_healthy
-    ports:
-      # Loopback only — never public. SSH tunnel to reach the UI.
-      - "127.0.0.1:3000:3000"
-    environment:
-      DATABASE_URL: postgresql://postgres:${POSTGRES_PASSWORD:-postgres}@postgres:5432/langfuse
-      NEXTAUTH_URL: http://localhost:3000
-      NEXTAUTH_SECRET: ${LANGFUSE_NEXTAUTH_SECRET}
-      SALT: ${LANGFUSE_SALT}
-      TELEMETRY_ENABLED: "false"
 
   nginx:
     image: nginx:1.27-alpine

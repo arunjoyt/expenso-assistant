@@ -22,7 +22,7 @@ from .conftest import API, method_url
 from .fakes import ScriptedChatModel
 from .test_agent_session import answer, collect, run_turn, tool_call
 
-pytestmark = pytest.mark.usefixtures("spy_langfuse_default")
+pytestmark = pytest.mark.usefixtures("spy_tracing_default")
 
 MODIFIED = "2026-03-14 09:00:00"
 EXPENSE_ROW = {
@@ -37,8 +37,8 @@ EXPENSE_ROW = {
 
 
 @pytest.fixture
-def spy_langfuse_default(spy_langfuse):
-    return spy_langfuse()
+def spy_tracing_default(spy_tracing):
+    return spy_tracing()
 
 
 def multi_call(*calls: tuple[str, dict]) -> AIMessage:
@@ -431,8 +431,11 @@ async def test_the_tool_call_cap_resets_on_the_resume_leg(member, monkeypatch):
 
 
 @respx.mock
-async def test_resume_opens_its_own_trace_and_skips_the_chat_cap(member, spy_langfuse):
-    spy = spy_langfuse()
+async def test_resume_opens_its_own_trace_and_skips_the_chat_cap(
+    member, spy_tracing, spy_token_store
+):
+    spy = spy_tracing()
+    store = spy_token_store()
     _stub_get_expenses([EXPENSE_ROW])
     respx.post(method_url(f"{API}.update_expense")).mock(
         return_value=httpx.Response(200, json={"message": {"name": "EXP-17"}})
@@ -446,13 +449,16 @@ async def test_resume_opens_its_own_trace_and_skips_the_chat_cap(member, spy_lan
     )
     graph = build_graph(model, checkpointer=InMemorySaver())
     await run_turn(graph, member, "bump it")
-    fetches_after_chat = len(spy.fetch_calls)
+    store.get = _fail_if_called  # no daily-cap check on resume
 
     await _resume(graph, member, {"decisions": [approve()]})
 
-    assert len(spy.fetch_calls) == fetches_after_chat  # no daily-cap check on resume
-    chat_traces = [t for t in spy.traces if {"feature:chat"} <= set(t.init.get("tags", []))]
+    chat_traces = [t for t in spy.recorded if "feature:chat" in t.tags]
     assert len(chat_traces) == 2  # the turn + the resume leg
+
+
+def _fail_if_called(*_):
+    raise AssertionError("the daily cap was checked")
 
 
 # --- card text --------------------------------------------------------

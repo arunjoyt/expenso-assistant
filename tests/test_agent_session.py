@@ -18,13 +18,13 @@ from expenso_assistant.config import get_settings
 from .conftest import API, method_url
 from .fakes import ScriptedChatModel
 
-pytestmark = pytest.mark.usefixtures("spy_langfuse_default")
+pytestmark = pytest.mark.usefixtures("spy_tracing_default")
 
 
 @pytest.fixture
-def spy_langfuse_default(spy_langfuse):
+def spy_tracing_default(spy_tracing):
     """Most tests just need a spy that reports 'under the cap'."""
-    return spy_langfuse()
+    return spy_tracing()
 
 
 def tool_call(name: str, **args) -> AIMessage:

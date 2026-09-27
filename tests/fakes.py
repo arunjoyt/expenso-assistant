@@ -1,4 +1,4 @@
-"""Test doubles for the agent: a scripted chat model and a Langfuse spy.
+"""Test doubles for the agent: a scripted chat model and a LangSmith spy.
 
 The scripted model keeps OpenAI out of every agent test (P6-S5 TEST_PLAN) — it
 replays a list of `AIMessage`s, honouring `tool_calls` and `usage_metadata`.
@@ -7,12 +7,14 @@ replays a list of `AIMessage`s, honouring `tool_calls` and `usage_metadata`.
 from __future__ import annotations
 
 import json
-from types import SimpleNamespace
 from typing import Any
 
 from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import AIMessage, AIMessageChunk, ToolMessage
 from langchain_core.outputs import ChatGeneration, ChatGenerationChunk, ChatResult
+from langchain_core.tracers import LangChainTracer
+from langchain_core.tracers.schemas import Run
+from langsmith import Client
 from pydantic import Field, PrivateAttr
 
 
@@ -20,7 +22,9 @@ class ScriptedChatModel(BaseChatModel):
     responses: list = Field(default_factory=list)
     bound_tools: list[str] = Field(default_factory=list)
     calls: int = 0
-    last_prompt: list = Field(default_factory=list)
+    # Out of the repr: middleware runs trace the model object itself, and a
+    # real model holds no prompt (test_agent_observability's image check).
+    last_prompt: list = Field(default_factory=list, repr=False)
     _cursor: int = PrivateAttr(default=0)
 
     @property
@@ -74,24 +78,6 @@ class ScriptedChatModel(BaseChatModel):
             yield ChatGenerationChunk(message=chunk)
 
 
-class SpyTrace:
-    def __init__(self, **init):
-        self.init = init
-        self.updates: list[dict] = []
-        self.generations: list[dict] = []
-        self.scores: list[dict] = []
-
-    def update(self, **kwargs) -> None:
-        self.updates.append(kwargs)
-
-    def generation(self, **kwargs) -> SpyTrace:
-        self.generations.append(kwargs)
-        return self
-
-    def score(self, **kwargs) -> None:
-        self.scores.append(kwargs)
-
-
 class SpyTokenStore:
     """Fake for `observability.PostgresTokenStore` — an in-memory dict keyed by
     user_id (tests run within one 'today', so the date dimension is dropped)."""
@@ -112,38 +98,40 @@ class SpyTokenStore:
         self.totals[user_id] = self.totals.get(user_id, self._default) + tokens
 
 
-class SpyLangfuse:
-    def __init__(
-        self,
-        *,
-        today_trace_count: int = 0,
-        today_trace_counts: dict[str, int] | None = None,
-        fetch_raises: Exception | None = None,
-    ):
-        self._today = today_trace_count
-        # Per-`feature:<x>` tag override — falls back to `_today` for any tag
-        # not listed, so existing single-feature tests are unaffected.
-        self._today_by_tag = today_trace_counts or {}
-        self._fetch_raises = fetch_raises
-        self.traces: list[SpyTrace] = []
-        self.fetch_calls: list[dict] = []
-        self.flushed = 0
+class SpyTracer(LangChainTracer):
+    """The stock tracer, so runs carry the inputs LangSmith would get. Records
+    each finished trace's root run, child runs attached."""
 
-    def trace(self, **kwargs) -> SpyTrace:
-        trace = SpyTrace(**kwargs)
-        self.traces.append(trace)
-        return trace
+    def _persist_run(self, run: Run) -> None:
+        self.client.recorded.append(run)
 
-    def fetch_traces(self, **kwargs):
-        self.fetch_calls.append(kwargs)
-        if self._fetch_raises is not None:
-            raise self._fetch_raises
-        tag = (kwargs.get("tags") or [None])[0]
-        count = self._today_by_tag.get(tag, self._today)
-        return SimpleNamespace(data=[object()] * count)
+
+class SpyLangSmith(Client):
+    """A LangSmith client that never touches the network: records feedback,
+    drops runs, and hands out tracers that record every trace."""
+
+    def __init__(self):
+        super().__init__(api_url="http://langsmith.test", api_key="test", auto_batch_tracing=False)
+        self.recorded: list[Run] = []
+        self.feedback: list[dict] = []
+
+    def create_run(self, *_, **__) -> None:
+        pass
+
+    def update_run(self, *_, **__) -> None:
+        pass
+
+    def tracer(self) -> SpyTracer:
+        return SpyTracer(client=self)
+
+    def create_feedback(self, *, trace_id, key: str, score: float) -> None:
+        self.feedback.append({"trace_id": trace_id, "key": key, "score": score})
 
     def flush(self) -> None:
-        self.flushed += 1
+        pass
+
+    def scores(self, trace: Run) -> dict[str, float]:
+        return {f["key"]: f["score"] for f in self.feedback if f["trace_id"] == trace.id}
 
 
 def _reject_unanswered_tool_calls(messages) -> None:

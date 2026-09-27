@@ -36,8 +36,8 @@ def _no_mcp(monkeypatch):
 
 
 @pytest.fixture
-def app(spy_langfuse):
-    spy_langfuse()
+def app(spy_tracing):
+    spy_tracing()
     model = ScriptedChatModel(responses=[answer("You spent 12.")] * 4)
     checkpointer = InMemorySaver()
     from expenso_assistant.api.main import create_app
@@ -131,7 +131,7 @@ async def test_chat_accepts_an_attached_image(client):
     assert _events(chat.text)[0] == ("step", {"text": "Reading the receipt…"})
 
 
-async def test_chat_rejects_an_oversized_image(monkeypatch, spy_langfuse):
+async def test_chat_rejects_an_oversized_image(monkeypatch, spy_tracing):
     # Settings are captured by `create_app` at construction time, so the cap
     # must be set *before* building the app — the shared `app`/`client`
     # fixtures already baked in the default cap by the time a test body runs.
@@ -140,7 +140,7 @@ async def test_chat_rejects_an_oversized_image(monkeypatch, spy_langfuse):
 
     monkeypatch.setenv("MAX_RECEIPT_IMAGE_CHARS", "10")
     get_settings.cache_clear()
-    spy_langfuse()
+    spy_tracing()
     checkpointer = InMemorySaver()
     graph = build_graph(ScriptedChatModel(responses=[]), checkpointer=checkpointer)
     app = create_app(graph=graph, checkpointer=checkpointer)
@@ -156,7 +156,7 @@ async def test_chat_rejects_an_oversized_image(monkeypatch, spy_langfuse):
     assert chat.status_code == 413
 
 
-async def test_chat_rejects_an_oversized_message(monkeypatch, spy_langfuse):
+async def test_chat_rejects_an_oversized_message(monkeypatch, spy_tracing):
     # Same caveat as the oversized-image test above: the cap is captured by
     # `create_app` at construction time, so it must be set before building it.
     from expenso_assistant.api.main import create_app
@@ -164,7 +164,7 @@ async def test_chat_rejects_an_oversized_message(monkeypatch, spy_langfuse):
 
     monkeypatch.setenv("MAX_CHAT_MESSAGE_CHARS", "10")
     get_settings.cache_clear()
-    spy_langfuse()
+    spy_tracing()
     checkpointer = InMemorySaver()
     graph = build_graph(ScriptedChatModel(responses=[]), checkpointer=checkpointer)
     app = create_app(graph=graph, checkpointer=checkpointer)
@@ -196,8 +196,8 @@ async def test_clear_chat_empties_the_thread(client):
 
 
 @pytest.fixture
-def proactive_app(spy_langfuse):
-    spy_langfuse()
+def proactive_app(spy_tracing):
+    spy_tracing()
     checkpointer = InMemorySaver()
     graph = build_graph(ScriptedChatModel(responses=[]), checkpointer=checkpointer)
     read_only_graph = build_graph(

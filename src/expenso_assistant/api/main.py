@@ -27,6 +27,7 @@ from .. import tools as tool_defs
 from ..agent import proactive, session
 from ..agent.graph import build_graph
 from ..agent.model import build_fallback_model, build_model
+from ..agent.observability import flush_traces
 from ..auth import AuthedMember, MemberDep
 from ..config import get_settings
 from ..frappe_client import aclose_http
@@ -96,6 +97,7 @@ def create_app(*, graph=None, checkpointer=None, read_only_graph=None) -> FastAP
                 )
             yield
         await aclose_http()
+        flush_traces()
 
     app = FastAPI(title="expenso-assistant", version=__version__, lifespan=lifespan)
     if injected:  # tests skip the lifespan; wire state up front

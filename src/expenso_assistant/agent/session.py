@@ -71,7 +71,7 @@ def humanize(tool_name: str, args: dict | None) -> str:
 async def stream_turn(
     *, graph, member: AuthedMember, text: str, settings: Settings, image: str | None = None
 ) -> AsyncIterator[str]:
-    # No fail-open here (unlike the old Langfuse-backed cap): the counter's
+    # No fail-open here (unlike the old tracing-backed cap): the counter's
     # storage is the checkpointer's own Postgres, already required for the
     # turn to run at all, so a check failure fails the turn the same way a
     # checkpointer failure downstream would (ADR 0008's 2026-09-11 update).
@@ -99,10 +99,7 @@ async def stream_turn(
         yield sse("step", {"text": "Reading the receipt…"})
 
     pre_ids = await _message_ids(graph, config)
-    trace = TurnTrace.start(
-        user_id=member.email, session_id=member.thread_id, user_input=text, feature=feature
-    )
-    config["callbacks"] = [trace.callback]
+    TurnTrace(user_id=member.email, session_id=member.thread_id, feature=feature).apply(config)
 
     # The graph's tool node reaches Frappe as this Member (bearer passthrough),
     # same contextvar the FastMCP adapter binds.
@@ -114,12 +111,11 @@ async def stream_turn(
             "messages": [HumanMessage(human_text)],
             "entry_method": entry_method,
         }
-        async for event in _drive(graph, inputs, config, context, trace, pre_ids, settings):
+        async for event in _drive(graph, inputs, config, context, pre_ids, settings):
             yield event
     finally:
         tool_defs.reset_entry_method(entry_token)
         reset_frappe_client(client_token)
-        _flush_trace()  # last, so the trace's final output/cost updates go too
 
 
 async def resume_turn(
@@ -127,17 +123,15 @@ async def resume_turn(
 ) -> AsyncIterator[str]:
     """The member's decision on a pending confirm card. Executes the approved
     subset (P6-S7) and streams the continuation on a fresh SSE leg — its own
-    Langfuse trace, no chat-cap re-check (the turn already passed it)."""
+    trace, no chat-cap re-check (the turn already passed it)."""
     config = _run_config(member, settings)
     card = await pending_card(graph, config)
     if card is None:
         yield sse("error", {"code": "nothing_to_resume", "message": "No pending confirmation."})
         return
 
-    trace = TurnTrace.start(
-        user_id=member.email, session_id=member.thread_id, user_input=json.dumps(decision)
-    )
-    config["callbacks"] = [trace.callback]
+    trace = TurnTrace(user_id=member.email, session_id=member.thread_id)
+    trace.apply(config)
     # The approved writes run on this leg, so they must carry the turn's own
     # entry method ("receipt" survives the pause in state, P7-S1).
     state = await graph.aget_state(config)
@@ -149,12 +143,11 @@ async def resume_turn(
     entry_token = tool_defs.bind_entry_method(entry_method)
     try:
         resume = Command(resume=decision)
-        async for event in _drive(graph, resume, config, context, trace, None, settings):
+        async for event in _drive(graph, resume, config, context, None, settings):
             yield event
     finally:
         tool_defs.reset_entry_method(entry_token)
         reset_frappe_client(client_token)
-        _flush_trace()
 
 
 async def history(graph, member: AuthedMember, settings: Settings) -> list[dict]:
@@ -207,11 +200,12 @@ def _human_text(text: str, image: str | None) -> str:
 
 
 async def _drive(
-    graph, inputs, config, context: RunContext, trace: TurnTrace, pre_ids, settings: Settings
+    graph, inputs, config, context: RunContext, pre_ids, settings: Settings
 ) -> AsyncIterator[str]:
     """Streams the run with LangGraph's own stream modes (ADR 0010): `tasks`
     for each tool as it runs, `messages` for answer tokens, `updates` for the
-    confirm card and the final reply's id."""
+    confirm card and the final reply's id. The tracer records the run's
+    outcome, errors included (ADR 0011)."""
     run = _RunStream()
     deadline = asyncio.get_event_loop().time() + settings.run_wall_clock_seconds
     parts = graph.astream(
@@ -236,22 +230,18 @@ async def _drive(
     except (TimeoutError, GraphRecursionError, ToolCallLimitExceededError) as exc:
         code = _ERROR_CODES[type(exc)]
         await _rollback(graph, config, pre_ids)
-        trace.fail(code)
         yield sse("error", {"code": code, "message": _ERROR_MESSAGES[code]})
         return
     except Exception:
         logger.exception("chat turn failed")
         await _rollback(graph, config, pre_ids)
-        trace.fail("internal")
         yield sse("error", {"code": "internal", "message": _ERROR_MESSAGES["internal"]})
         return
 
     if run.card is not None:
-        trace.finish(output="[needs confirmation]")
         yield sse("needs_confirmation", run.card)
         return
 
-    trace.finish(output="".join(run.answer))
     yield sse("done", {"message_id": run.message_id})
 
 
@@ -308,15 +298,6 @@ _ERROR_MESSAGES = {
     "tool_cap": "The assistant tried too many steps and stopped.",
     "internal": "The assistant hit an error.",
 }
-
-
-def _flush_trace() -> None:
-    from .observability import langfuse_client
-
-    try:
-        langfuse_client().flush()
-    except Exception as exc:
-        logger.warning("langfuse flush failed: %s", exc)
 
 
 def _chunk_text(chunk) -> str:
