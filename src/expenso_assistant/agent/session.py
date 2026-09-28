@@ -274,11 +274,12 @@ async def _drive(
 # LangGraph ships it as `@beta` ("experimental and may change"). Revisit when
 # that label is gone.
 _STREAM_MODES = ["tasks", "messages", "updates"]
-# LangGraph's default, stated on purpose (ADR 0010): each step is saved while
-# the next runs. "exit" would save only when the run ends — fewer Postgres
-# writes, but a crash mid-resume would lose the record of a committed write,
-# reopen the card, and let a re-confirm duplicate the row.
-_DURABILITY = "async"
+# Each step is saved before the next starts. A crash mid-resume must not lose
+# the record of a committed write: that would reopen the card and let a
+# re-confirm duplicate the row. "exit" saves only at the end; LangGraph's
+# default "async" saves while the next step runs, and the docs note a crash
+# can still skip that save. One awaited write per step is cheap here.
+_DURABILITY = "sync"
 
 
 class _RunStream:
