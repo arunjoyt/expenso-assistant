@@ -1,7 +1,8 @@
 """LangSmith tracing, receipt-accuracy feedback, and the daily token cap.
 
 ADR 0011 (supersedes ADR 0008's self-hosted Langfuse): every turn is one
-LangSmith trace, recorded by LangChain's stock `LangChainTracer`. The turn's
+LangSmith trace, recorded by the `LangChainTracer` that LangChain adds itself
+when tracing is on. The turn's
 root run carries `user_id` / `session_id` / `feature` as metadata and a
 `feature:<x>` tag; the tracer nests every model call, tool call, middleware
 step and confirm-card pause under it, and records errors and outputs itself.
@@ -12,10 +13,10 @@ leaves our infrastructure. Receipt images never do: `mask_images` replaces
 every image data URI in a run's inputs before upload. Amounts, categories,
 notes and member emails are sent as-is (ADR 0011).
 
-Tracing is off when `LANGSMITH_API_KEY` is empty; the key alone turns it on.
-Leave `LANGSMITH_TRACING` unset: a turn already carries this tracer, so
-LangChain adds none of its own, but any LangChain call made outside a turn
-would be traced by LangChain's default client, which does not mask images.
+Tracing is set up the way LangSmith recommends: the SDK reads
+`LANGSMITH_TRACING`, `LANGSMITH_API_KEY`, `LANGSMITH_ENDPOINT` and
+`LANGSMITH_PROJECT` from the process environment. `configure_tracing` makes a
+masking client LangSmith's default client, so every traced call masks images.
 
 The daily cap (`within_daily_token_cap`) reads a same-day token total from a
 small Postgres counter, not from the tracing backend (ADR 0008's 2026-09-11
@@ -30,11 +31,13 @@ from typing import Any
 from uuid import UUID, uuid4
 from zoneinfo import ZoneInfo
 
+import langsmith
 from langchain_core.callbacks import BaseCallbackHandler
 from langchain_core.messages import BaseMessage
 from langchain_core.outputs import LLMResult
-from langchain_core.tracers import LangChainTracer
+from langchain_core.tracers.langchain import get_client
 from langsmith import Client
+from langsmith.utils import tracing_is_enabled
 
 from ..config import get_settings
 
@@ -51,34 +54,25 @@ FEATURE_INSIGHTS = "insights"
 
 IMAGE_PLACEHOLDER = "[receipt image removed]"
 
-_client: Client | None = None
+
+def configure_tracing() -> None:
+    """Make a masking client LangSmith's default client. The app calls this at
+    startup, before any LangChain call. The client reads its key and endpoint
+    from the environment."""
+    if tracing_is_enabled():
+        langsmith.configure(client=Client(hide_inputs=mask_images))
 
 
 def langsmith_client() -> Client | None:
-    """The shared LangSmith client, or None when tracing is off."""
-    global _client
-    settings = get_settings()
-    if _client is None and settings.langsmith_api_key:
-        _client = Client(
-            api_url=settings.langsmith_endpoint,
-            api_key=settings.langsmith_api_key,
-            hide_inputs=mask_images,
-        )
-    return _client
+    """LangSmith's default client, or None when tracing is off."""
+    if not tracing_is_enabled():
+        return None
+    return get_client()
 
 
 def reset_langsmith_client() -> None:
-    """Drop the cached client — tests and a settings reload call this."""
-    global _client
-    _client = None
-
-
-def tracers() -> list[BaseCallbackHandler]:
-    """The stock LangSmith tracer for one run, or none when tracing is off."""
-    client = langsmith_client()
-    if client is None:
-        return []
-    return [LangChainTracer(client=client, project_name=get_settings().langsmith_project)]
+    """Drop the default client — tests call this."""
+    langsmith.configure(client=None)
 
 
 def flush_traces() -> None:
@@ -249,7 +243,7 @@ class TurnTrace:
                 "user_id": self._user_id,
                 "session_id": self._session_id,
             },
-            callbacks=[*tracers(), TokenCounter(self._user_id)],
+            callbacks=[TokenCounter(self._user_id)],
         )
         return config
 

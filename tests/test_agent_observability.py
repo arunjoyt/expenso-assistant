@@ -6,8 +6,9 @@ from __future__ import annotations
 import json
 
 import pytest
-from langchain_core.tracers import LangChainTracer
+from langchain_core.tracers.langchain import get_client
 from langgraph.checkpoint.memory import InMemorySaver
+from langsmith.utils import get_env_var
 
 from expenso_assistant.agent import observability
 from expenso_assistant.agent.graph import build_graph
@@ -141,25 +142,27 @@ def test_mask_images_keeps_everything_but_image_data():
 # --- configuration ---------------------------------------------------------
 
 
-def test_tracing_is_off_without_an_api_key(monkeypatch):
-    monkeypatch.delenv("LANGSMITH_API_KEY", raising=False)
-    get_settings.cache_clear()
-    observability.reset_langsmith_client()
+def test_tracing_is_off_without_the_tracing_flag():
+    observability.configure_tracing()
 
-    assert observability.tracers() == []
+    assert observability.langsmith_client() is None
     observability.flush_traces()  # a no-op, not an error
 
 
-def test_tracer_sends_to_the_us_region_with_images_masked(monkeypatch):
+def test_default_client_reads_the_environment_and_masks_images(monkeypatch):
+    """LangChain traces through LangSmith's default client, also for calls
+    made outside a turn. That client must mask images."""
+    monkeypatch.setenv("LANGSMITH_TRACING", "true")
     monkeypatch.setenv("LANGSMITH_API_KEY", "lsv2-test")
-    get_settings.cache_clear()
-    observability.reset_langsmith_client()
+    monkeypatch.setenv("LANGSMITH_ENDPOINT", "https://aws.api.smith.langchain.com")
+    get_env_var.cache_clear()
     try:
-        [tracer] = observability.tracers()
-        assert isinstance(tracer, LangChainTracer)
-        assert tracer.project_name == "expenso-assistant"
-        assert tracer.client.api_url == "https://aws.api.smith.langchain.com"
-        assert tracer.client._hide_inputs is mask_images
+        observability.configure_tracing()
+
+        client = observability.langsmith_client()
+        assert client is get_client()
+        assert client.api_url == "https://aws.api.smith.langchain.com"
+        assert client._hide_inputs is mask_images
     finally:
         observability.reset_langsmith_client()
 

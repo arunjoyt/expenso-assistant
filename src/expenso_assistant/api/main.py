@@ -27,7 +27,7 @@ from .. import tools as tool_defs
 from ..agent import proactive, session
 from ..agent.graph import build_graph
 from ..agent.model import build_fallback_model, build_model
-from ..agent.observability import flush_traces
+from ..agent.observability import configure_tracing, flush_traces
 from ..auth import AuthedMember, MemberDep
 from ..config import get_settings
 from ..frappe_client import aclose_http
@@ -80,6 +80,7 @@ def create_app(*, graph=None, checkpointer=None, read_only_graph=None) -> FastAP
                 app.state.graph, app.state.checkpointer = graph, checkpointer
                 app.state.read_only_graph = read_only_graph
             else:
+                configure_tracing()
                 app.state.checkpointer = await _build_checkpointer(stack, settings.database_url)
                 model = build_model(settings)
                 fallback = build_fallback_model(settings)

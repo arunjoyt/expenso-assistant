@@ -1,4 +1,5 @@
 import pytest
+from langsmith.utils import get_env_var
 
 from expenso_assistant import frappe_client
 from expenso_assistant.config import Settings, get_settings
@@ -12,8 +13,14 @@ def _settings(monkeypatch):
     # Never the developer's .env: it may hold a real LangSmith key, and a
     # test would then trace to the real project.
     monkeypatch.setitem(Settings.model_config, "env_file", None)
-    for name in ("LANGSMITH_API_KEY", "LANGSMITH_ENDPOINT", "LANGSMITH_PROJECT"):
+    for name in (
+        "LANGSMITH_TRACING",
+        "LANGSMITH_API_KEY",
+        "LANGSMITH_ENDPOINT",
+        "LANGSMITH_PROJECT",
+    ):
         monkeypatch.delenv(name, raising=False)
+    get_env_var.cache_clear()
     monkeypatch.setenv("FRAPPE_URL", FRAPPE_URL)
     monkeypatch.setenv("MCP_ENABLED", "true")
     monkeypatch.setenv("SERVICE_TIMEZONE", "UTC")
@@ -26,21 +33,22 @@ def _settings(monkeypatch):
 
 @pytest.fixture
 def spy_tracing(monkeypatch):
-    """Replace the LangSmith client and tracer with a recording spy. Returns a
-    factory, like the other spies."""
-    from expenso_assistant.agent import observability
+    """Turn tracing on with a recording spy as LangSmith's default client, and
+    the spy's tracer as the one LangChain adds. Returns a factory, like the
+    other spies."""
+    import langsmith
+    from langchain_core.tracers import langchain as langchain_tracers
 
-    from .fakes import SpyLangSmith
+    from .fakes import SpyLangSmith, SpyTracer
 
     def install() -> SpyLangSmith:
         spy = SpyLangSmith()
-        monkeypatch.setattr(observability, "_client", spy)
-        monkeypatch.setattr(observability, "tracers", lambda: [spy.tracer()])
+        monkeypatch.setattr(langchain_tracers, "LangChainTracer", SpyTracer)
+        langsmith.configure(client=spy, enabled=True)
         return spy
 
-    observability.reset_langsmith_client()
     yield install
-    observability.reset_langsmith_client()
+    langsmith.configure(client=None, enabled=None)
 
 
 @pytest.fixture

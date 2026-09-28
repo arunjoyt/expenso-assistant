@@ -48,7 +48,7 @@ uv run ruff check .
 
 # run the service against a local Frappe bench
 cp .env.example .env   # set FRAPPE_URL etc.
-uv run uvicorn expenso_assistant.api.main:app --reload --port 8080
+uv run --env-file .env uvicorn expenso_assistant.api.main:app --reload --port 8080
 ```
 
 ## Deploy

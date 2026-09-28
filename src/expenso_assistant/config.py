@@ -39,12 +39,6 @@ class Settings(BaseSettings):
     def cors_origins(self) -> list[str]:
         return [origin.strip() for origin in self.allowed_cors_origins.split(",") if origin.strip()]
 
-    # Tracing (ADR 0011) — hosted LangSmith, US region. Empty key turns
-    # tracing off. Receipt images are masked before upload.
-    langsmith_api_key: str = ""
-    langsmith_endpoint: str = "https://aws.api.smith.langchain.com"
-    langsmith_project: str = "expenso-assistant"
-
     # LangGraph checkpointer (P6-S5) and the daily token counter.
     database_url: str = "postgresql://postgres:postgres@localhost:5432/assistant"
 

@@ -100,15 +100,15 @@ class SpyTokenStore:
 
 class SpyTracer(LangChainTracer):
     """The stock tracer, so runs carry the inputs LangSmith would get. Records
-    each finished trace's root run, child runs attached."""
+    each finished trace's root run, child runs attached, on its client."""
 
     def _persist_run(self, run: Run) -> None:
         self.client.recorded.append(run)
 
 
 class SpyLangSmith(Client):
-    """A LangSmith client that never touches the network: records feedback,
-    drops runs, and hands out tracers that record every trace."""
+    """A LangSmith client that never touches the network: records feedback
+    and the traces its `SpyTracer` finishes, and drops runs."""
 
     def __init__(self):
         super().__init__(api_url="http://langsmith.test", api_key="test", auto_batch_tracing=False)
@@ -120,9 +120,6 @@ class SpyLangSmith(Client):
 
     def update_run(self, *_, **__) -> None:
         pass
-
-    def tracer(self) -> SpyTracer:
-        return SpyTracer(client=self)
 
     def create_feedback(self, *, trace_id, key: str, score: float) -> None:
         self.feedback.append({"trace_id": trace_id, "key": key, "score": score})
