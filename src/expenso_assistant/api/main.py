@@ -176,11 +176,27 @@ def create_app(*, graph=None, checkpointer=None, read_only_graph=None) -> FastAP
 
 
 async def _build_checkpointer(stack: AsyncExitStack, database_url: str):
+    """A pooled saver. `from_conn_string` holds one connection that never
+    reconnects, so a Postgres restart failed every request until the app
+    restarted. The pool checks each connection before handing it out."""
     from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
+    from psycopg.rows import dict_row
+    from psycopg_pool import AsyncConnectionPool
 
-    checkpointer = await stack.enter_async_context(
-        AsyncPostgresSaver.from_conn_string(database_url)
+    pool = await stack.enter_async_context(
+        AsyncConnectionPool(
+            database_url,
+            # The saver serializes its own calls behind one lock, so a larger
+            # pool buys nothing; the pool is here for reconnection.
+            min_size=1,
+            max_size=2,
+            check=AsyncConnectionPool.check_connection,
+            # What `from_conn_string` sets; the saver depends on all three.
+            kwargs={"autocommit": True, "prepare_threshold": 0, "row_factory": dict_row},
+            open=False,
+        )
     )
+    checkpointer = AsyncPostgresSaver(pool)
     await checkpointer.setup()
     return checkpointer
 

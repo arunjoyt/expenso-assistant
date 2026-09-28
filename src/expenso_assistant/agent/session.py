@@ -76,7 +76,8 @@ async def stream_turn(
     # turn to run at all, so a check failure fails the turn the same way a
     # checkpointer failure downstream would (ADR 0008's 2026-09-11 update).
     try:
-        allowed = within_daily_token_cap(member.email)
+        # A sync Postgres read: off the event loop so it never stalls other turns.
+        allowed = await asyncio.to_thread(within_daily_token_cap, member.email)
     except Exception:
         logger.exception("daily cap check failed")
         yield sse("error", {"code": "internal", "message": _ERROR_MESSAGES["internal"]})

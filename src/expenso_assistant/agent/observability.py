@@ -115,40 +115,55 @@ class PostgresTokenStore:
     A same-day, increment-only numeric aggregate with no per-call detail —
     not a record of an LLM call; the trace stays that record. Lives as a table in the
     LangGraph checkpointer's own Postgres (`config.database_url`), not a new
-    datastore."""
+    datastore.
+
+    Pooled, not one connection: a single connection never reconnects, so a
+    Postgres restart failed every turn's cap check until the app restarted
+    (expenso-assistant#7). The pool checks each connection before use."""
 
     def __init__(self, database_url: str):
-        import psycopg
+        from psycopg_pool import ConnectionPool
 
-        self._conn = psycopg.connect(database_url, autocommit=True)
-        self._conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS assistant_daily_token_usage (
-                user_id TEXT NOT NULL,
-                usage_date DATE NOT NULL,
-                tokens BIGINT NOT NULL DEFAULT 0,
-                PRIMARY KEY (user_id, usage_date)
-            )
-            """
+        self._pool = ConnectionPool(
+            database_url,
+            min_size=1,
+            max_size=2,
+            check=ConnectionPool.check_connection,
+            kwargs={"autocommit": True},
+            open=True,
         )
+        with self._pool.connection() as conn:
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS assistant_daily_token_usage (
+                    user_id TEXT NOT NULL,
+                    usage_date DATE NOT NULL,
+                    tokens BIGINT NOT NULL DEFAULT 0,
+                    PRIMARY KEY (user_id, usage_date)
+                )
+                """
+            )
 
     def get(self, user_id: str, today: date) -> int:
-        row = self._conn.execute(
-            "SELECT tokens FROM assistant_daily_token_usage WHERE user_id = %s AND usage_date = %s",
-            (user_id, today),
-        ).fetchone()
+        with self._pool.connection() as conn:
+            row = conn.execute(
+                "SELECT tokens FROM assistant_daily_token_usage "
+                "WHERE user_id = %s AND usage_date = %s",
+                (user_id, today),
+            ).fetchone()
         return row[0] if row else 0
 
     def add(self, user_id: str, today: date, tokens: int) -> None:
-        self._conn.execute(
-            """
-            INSERT INTO assistant_daily_token_usage (user_id, usage_date, tokens)
-            VALUES (%s, %s, %s)
-            ON CONFLICT (user_id, usage_date)
-            DO UPDATE SET tokens = assistant_daily_token_usage.tokens + EXCLUDED.tokens
-            """,
-            (user_id, today, tokens),
-        )
+        with self._pool.connection() as conn:
+            conn.execute(
+                """
+                INSERT INTO assistant_daily_token_usage (user_id, usage_date, tokens)
+                VALUES (%s, %s, %s)
+                ON CONFLICT (user_id, usage_date)
+                DO UPDATE SET tokens = assistant_daily_token_usage.tokens + EXCLUDED.tokens
+                """,
+                (user_id, today, tokens),
+            )
 
 
 _token_store: Any | None = None
