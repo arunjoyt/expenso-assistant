@@ -130,12 +130,17 @@ async def resume_turn(
         yield sse("error", {"code": "nothing_to_resume", "message": "No pending confirmation."})
         return
 
-    trace = TurnTrace(user_id=member.email, session_id=member.thread_id)
-    trace.apply(config)
     # The approved writes run on this leg, so they must carry the turn's own
-    # entry method ("receipt" survives the pause in state, P7-S1).
+    # entry method ("receipt" survives the pause in state, P7-S1). The trace
+    # takes the turn's feature too, so a receipt's accuracy feedback sits
+    # under `feature:receipt`.
     state = await graph.aget_state(config)
     entry_method = (state.values or {}).get("entry_method", "assistant")
+    feature = FEATURE_RECEIPT if entry_method == "receipt" else FEATURE_CHAT
+    trace = TurnTrace(
+        user_id=member.email, session_id=member.thread_id, feature=feature, leg="resume"
+    )
+    trace.apply(config)
     if entry_method == "receipt":
         score_receipt_accuracy(card, decision, trace)
     context = _run_context(settings)

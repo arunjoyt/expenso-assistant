@@ -150,7 +150,7 @@ def test_tracing_is_off_without_an_api_key(monkeypatch):
     observability.flush_traces()  # a no-op, not an error
 
 
-def test_tracer_sends_to_the_eu_region_with_images_masked(monkeypatch):
+def test_tracer_sends_to_the_us_region_with_images_masked(monkeypatch):
     monkeypatch.setenv("LANGSMITH_API_KEY", "lsv2-test")
     get_settings.cache_clear()
     observability.reset_langsmith_client()
@@ -158,7 +158,7 @@ def test_tracer_sends_to_the_eu_region_with_images_masked(monkeypatch):
         [tracer] = observability.tracers()
         assert isinstance(tracer, LangChainTracer)
         assert tracer.project_name == "expenso-assistant"
-        assert tracer.client.api_url == "https://eu.api.smith.langchain.com"
+        assert tracer.client.api_url == "https://aws.api.smith.langchain.com"
         assert tracer.client._hide_inputs is mask_images
     finally:
         observability.reset_langsmith_client()

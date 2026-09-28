@@ -193,6 +193,10 @@ async def test_unedited_confirm_scores_full_agreement_on_the_resume_trace(member
     await _resume(graph, member, {"decisions": [{"type": "approve"}]})
 
     resume_trace = next(t for t in spy.recorded if t not in traces_before_resume)
+    # the resume leg keeps the turn's feature, so its feedback sits under it
+    assert resume_trace.name == "receipt-resume"
+    assert "feature:receipt" in resume_trace.tags
+    assert resume_trace.extra["metadata"]["feature"] == "receipt"
     scores = spy.scores(resume_trace)
     assert scores == {
         "receipt_accuracy_amount": 1.0,

@@ -1,7 +1,7 @@
 import pytest
 
 from expenso_assistant import frappe_client
-from expenso_assistant.config import get_settings
+from expenso_assistant.config import Settings, get_settings
 
 FRAPPE_URL = "http://frappe.test"
 API = "expenso.expenso.api"
@@ -9,6 +9,11 @@ API = "expenso.expenso.api"
 
 @pytest.fixture(autouse=True)
 def _settings(monkeypatch):
+    # Never the developer's .env: it may hold a real LangSmith key, and a
+    # test would then trace to the real project.
+    monkeypatch.setitem(Settings.model_config, "env_file", None)
+    for name in ("LANGSMITH_API_KEY", "LANGSMITH_ENDPOINT", "LANGSMITH_PROJECT"):
+        monkeypatch.delenv(name, raising=False)
     monkeypatch.setenv("FRAPPE_URL", FRAPPE_URL)
     monkeypatch.setenv("MCP_ENABLED", "true")
     monkeypatch.setenv("SERVICE_TIMEZONE", "UTC")

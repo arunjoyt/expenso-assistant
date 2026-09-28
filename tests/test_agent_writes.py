@@ -453,8 +453,8 @@ async def test_resume_opens_its_own_trace_and_skips_the_chat_cap(
 
     await _resume(graph, member, {"decisions": [approve()]})
 
-    chat_traces = [t for t in spy.recorded if "feature:chat" in t.tags]
-    assert len(chat_traces) == 2  # the turn + the resume leg
+    assert [t.name for t in spy.recorded] == ["chat-turn", "chat-resume"]
+    assert all("feature:chat" in t.tags for t in spy.recorded)
 
 
 def _fail_if_called(*_):

@@ -7,13 +7,15 @@ root run carries `user_id` / `session_id` / `feature` as metadata and a
 step and confirm-card pause under it, and records errors and outputs itself.
 LangSmith prices each model call from its own model table.
 
-Traces go to hosted LangSmith (EU region by default), so family financial data
+Traces go to hosted LangSmith (US region by default), so family financial data
 leaves our infrastructure. Receipt images never do: `mask_images` replaces
 every image data URI in a run's inputs before upload. Amounts, categories,
 notes and member emails are sent as-is (ADR 0011).
 
-Tracing is off when `LANGSMITH_API_KEY` is empty. Do not also set
-`LANGSMITH_TRACING`: LangChain would then add a second, unmasked tracer.
+Tracing is off when `LANGSMITH_API_KEY` is empty; the key alone turns it on.
+Leave `LANGSMITH_TRACING` unset: a turn already carries this tracer, so
+LangChain adds none of its own, but any LangChain call made outside a turn
+would be traced by LangChain's default client, which does not mask images.
 
 The daily cap (`within_daily_token_cap`) reads a same-day token total from a
 small Postgres counter, not from the tracing backend (ADR 0008's 2026-09-11
@@ -222,20 +224,24 @@ def _local_today() -> date:
 
 
 class TurnTrace:
-    """One LangSmith trace for one turn. `apply` puts the root run's id, name,
-    tags and metadata on the run config, next to the tracer and the daily
-    token counter."""
+    """One LangSmith trace for one leg of a turn: `turn` for the message,
+    `resume` for the confirm-card decision. `apply` puts the root run's id,
+    name, tags and metadata on the run config, next to the tracer and the
+    daily token counter."""
 
-    def __init__(self, *, user_id: str, session_id: str, feature: str = FEATURE_CHAT):
+    def __init__(
+        self, *, user_id: str, session_id: str, feature: str = FEATURE_CHAT, leg: str = "turn"
+    ):
         self.run_id: UUID = uuid4()
         self._user_id = user_id
         self._session_id = session_id
         self._feature = feature
+        self._leg = leg
 
     def apply(self, config: dict) -> dict:
         config.update(
             run_id=self.run_id,
-            run_name=f"{self._feature}-turn",
+            run_name=f"{self._feature}-{self._leg}",
             tags=[f"feature:{self._feature}"],
             # `session_id` groups a Member's turns into one LangSmith thread.
             metadata={
