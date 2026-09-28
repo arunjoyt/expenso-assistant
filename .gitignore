@@ -9,3 +9,8 @@ docker-compose.override.yml
 dist/
 *.egg-info/
 .DS_Store
+
+# LangChain agent skills (`npx skills add`): local reference, not project code
+.agents/
+.claude/skills/
+skills-lock.json
