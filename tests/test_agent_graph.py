@@ -7,10 +7,11 @@ import pathlib
 from datetime import date
 
 from langchain_core.messages import AIMessage, HumanMessage
+from langchain_core.utils.function_calling import convert_to_openai_tool
 from langgraph.checkpoint.memory import InMemorySaver
 
 from expenso_assistant import tools
-from expenso_assistant.agent.graph import bound_tool_names, build_graph
+from expenso_assistant.agent.graph import _as_lc_tool, bound_tool_names, build_graph
 from expenso_assistant.agent.state import RunContext
 
 from .fakes import ScriptedChatModel
@@ -38,6 +39,16 @@ async def test_read_only_graph_binds_no_write_tool():
     assert set(model.bound_tools) == {fn.__name__ for fn in tools.READ_TOOLS}
     assert not set(model.bound_tools) & write_names
     assert not any("HumanInTheLoop" in node for node in graph.get_graph().nodes)
+
+
+def test_every_tool_argument_reaches_the_model_described():
+    """The model sees only the schema. An argument with no `Args:` entry in
+    its docstring reaches the model as a bare name and type."""
+    for fn in tools.ALL_TOOLS:
+        schema = convert_to_openai_tool(_as_lc_tool(fn))["function"]
+        for arg, spec in schema["parameters"]["properties"].items():
+            assert spec.get("description"), f"{fn.__name__}.{arg} has no description"
+        assert "Args:" not in schema["description"]
 
 
 def test_agent_package_imports_no_mcp():

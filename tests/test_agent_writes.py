@@ -254,6 +254,17 @@ async def test_rejecting_one_action_writes_only_the_rest(member):
     assert json.loads(update.calls.last.request.read())["name"] == "EXP-17"
     rejected = next(m for m in model.last_prompt if getattr(m, "tool_call_id", None) == "w1")
     assert "rejected" in rejected.content.lower()
+    # The domain message, not the stock "unless the user explicitly requests it".
+    assert "declined this change on the confirm card" in rejected.content
+    assert "explicitly requests" not in rejected.content
+
+
+def test_a_reject_message_from_the_client_is_kept():
+    decision = {"decisions": [approve(), {"type": "reject", "message": "Wrong amount"}]}
+
+    filled = session.with_reject_messages(decision)
+
+    assert filled["decisions"] == decision["decisions"]
 
 
 @respx.mock

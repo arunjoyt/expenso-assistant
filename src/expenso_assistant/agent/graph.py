@@ -123,15 +123,15 @@ def _frappe_error_text(exc: Exception, request) -> str | None:
     if not isinstance(exc, FrappeError):
         return None  # anything else is a bug: let it fail the turn
     name = request.tool_call["name"]
-    if "TimestampMismatchError" in exc.detail:
+    if exc.exc_type == "TimestampMismatchError":
         return f"{name}: the row changed since you read it — re-read it and propose again."
-    return f"{name} could not be applied: {exc.detail}"
+    # Only the Member-facing text: the raw body can carry a traceback.
+    return f"{name} could not be applied: {exc.user_message}"
 
 
 def _as_lc_tool(fn: Callable[..., Any]) -> StructuredTool:
-    return StructuredTool.from_function(
-        coroutine=fn, name=fn.__name__, description=fn.__doc__ or fn.__name__
-    )
+    # `Args:` in the docstring becomes each argument's schema description.
+    return StructuredTool.from_function(coroutine=fn, name=fn.__name__, parse_docstring=True)
 
 
 def _resolve_tools(tools: Sequence[Callable[..., Any]] | None) -> list[Callable[..., Any]]:

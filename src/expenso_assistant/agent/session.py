@@ -147,12 +147,31 @@ async def resume_turn(
     client_token = bind_frappe_client(FrappeClient(member.token))
     entry_token = tool_defs.bind_entry_method(entry_method)
     try:
-        resume = Command(resume=decision)
+        resume = Command(resume=with_reject_messages(decision))
         async for event in _drive(graph, resume, config, context, None, settings):
             yield event
     finally:
         tool_defs.reset_entry_method(entry_token)
         reset_frappe_client(client_token)
+
+
+def with_reject_messages(decision: dict) -> dict:
+    """The decision with a domain message on every bare `reject`. The stock
+    default says "do not retry unless the user asks"; the LangChain docs ask
+    side-effecting tools for a message that says what to do instead."""
+    decisions = [
+        {**choice, "message": _REJECT_MESSAGE}
+        if choice.get("type") == "reject" and not choice.get("message")
+        else choice
+        for choice in decision.get("decisions") or []
+    ]
+    return {**decision, "decisions": decisions}
+
+
+_REJECT_MESSAGE = (
+    "The member declined this change on the confirm card, so it was not made. "
+    "Do not propose it again. Say plainly that it was not made, and stop."
+)
 
 
 async def history(graph, member: AuthedMember, settings: Settings) -> list[dict]:
@@ -250,6 +269,9 @@ async def _drive(
     yield sse("done", {"message_id": run.message_id})
 
 
+# Not `stream_events(version="v3")`, although the LangChain docs recommend it:
+# LangGraph ships it as `@beta` ("experimental and may change"). Revisit when
+# that label is gone.
 _STREAM_MODES = ["tasks", "messages", "updates"]
 # LangGraph's default, stated on purpose (ADR 0010): each step is saved while
 # the next runs. "exit" would save only when the run ends — fewer Postgres

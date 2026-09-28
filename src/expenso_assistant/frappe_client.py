@@ -10,6 +10,8 @@ client's (ADR 0008).
 from __future__ import annotations
 
 import contextvars
+import json
+import re
 
 import httpx
 
@@ -37,10 +39,14 @@ async def aclose_http() -> None:
 
 
 class FrappeError(RuntimeError):
-    def __init__(self, status_code: int, detail: str):
-        super().__init__(f"Frappe REST {status_code}: {detail}")
+    """A Frappe error response. `detail` is the raw body for logs and may hold
+    a traceback; `user_message` is only what Frappe would show the Member."""
+
+    def __init__(self, status_code: int, body: str):
         self.status_code = status_code
-        self.detail = detail
+        self.detail = body[:500]
+        self.exc_type, self.user_message = _parse_error(status_code, body)
+        super().__init__(f"Frappe REST {status_code}: {self.detail}")
 
 
 class FrappeClient:
@@ -61,7 +67,7 @@ class FrappeClient:
             response = await http.get(url, headers=headers, params=payload)
 
         if response.status_code >= 400:
-            raise FrappeError(response.status_code, response.text[:500])
+            raise FrappeError(response.status_code, response.text)
         return response.json().get("message")
 
 
@@ -78,3 +84,33 @@ def current_frappe_client() -> FrappeClient:
         return _current_client.get()
     except LookupError as exc:
         raise RuntimeError("No FrappeClient bound to the current context") from exc
+
+
+def _parse_error(status_code: int, body: str) -> tuple[str | None, str]:
+    """(exc_type, user_message) from a Frappe v1 error body. The Member-facing
+    text is `_server_messages`: a JSON list of JSON-encoded message dicts.
+    `exc` and `exception` carry the traceback and are never read here."""
+    try:
+        data = json.loads(body)
+    except ValueError:
+        data = None
+    if not isinstance(data, dict):
+        return None, f"HTTP {status_code}"
+    messages = [text for text in _server_messages(data) if text]
+    exc_type = data.get("exc_type")
+    return exc_type, " ".join(messages) or exc_type or f"HTTP {status_code}"
+
+
+def _server_messages(data: dict) -> list[str]:
+    try:
+        entries = [json.loads(entry) for entry in json.loads(data.get("_server_messages") or "[]")]
+    except (TypeError, ValueError):
+        return []
+    return [
+        _HTML_TAG.sub("", str(entry.get("message", ""))).strip()
+        for entry in entries
+        if isinstance(entry, dict)
+    ]
+
+
+_HTML_TAG = re.compile(r"<[^>]+>")

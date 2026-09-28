@@ -34,5 +34,9 @@ def _chat_openai(settings: Settings, model: str) -> BaseChatModel:
         api_key=settings.openai_api_key or "unset",
         temperature=0,
         streaming=True,
+        # Stated on purpose: ChatOpenAI turns this off by itself when
+        # OPENAI_BASE_URL or a proxy is set, and every streamed call then
+        # reports zero tokens to the daily cap (expenso-assistant#4).
+        stream_usage=True,
         timeout=settings.http_timeout_seconds,
     )

@@ -46,22 +46,44 @@ def reset_entry_method(token: contextvars.Token) -> None:
 
 
 async def get_expenses(month: int, year: int) -> list[dict]:
-    """List the Family's Expenses for a calendar month (month 1-12, four-digit year)."""
+    """List the Family's Expenses for a calendar month. Each row carries its
+    `name` and `modified`, which an update or delete needs.
+
+    Args:
+        month: Calendar month, 1-12.
+        year: Four-digit year.
+    """
     return await current_frappe_client().call(f"{_API}.get_expenses", month=month, year=year)
 
 
 async def get_income(month: int, year: int) -> list[dict]:
-    """List the Family's Income entries for a calendar month."""
+    """List the Family's Income entries for a calendar month. Each row carries
+    its `name` and `modified`, which an update or delete needs.
+
+    Args:
+        month: Calendar month, 1-12.
+        year: Four-digit year.
+    """
     return await current_frappe_client().call(f"{_API}.get_income", month=month, year=year)
 
 
 async def get_analytics(month: int, year: int) -> dict:
-    """The Family's monthly totals, per-Category breakdown and Budget status."""
+    """The Family's monthly totals, per-Category breakdown and Budget status.
+
+    Args:
+        month: Calendar month, 1-12.
+        year: Four-digit year.
+    """
     return await current_frappe_client().call(f"{_API}.get_analytics", month=month, year=year)
 
 
 async def get_budgets(month: int, year: int) -> list[dict]:
-    """The Family's Budget amount per Category for a month."""
+    """The Family's Budget amount per Category for a month.
+
+    Args:
+        month: Calendar month, 1-12.
+        year: Four-digit year.
+    """
     return await current_frappe_client().call(f"{_API}.get_budgets", month=month, year=year)
 
 
@@ -85,10 +107,18 @@ async def create_expense(
     notes: str | None = None,
     message: str | None = None,
 ) -> dict:
-    """Create an Expense. `category` is matched to an existing Category by name
-    or label; an unmatched value is left unset. `message` is stored for audit
-    only on external-connector writes (never shown in the app) — omit it for
-    in-app Assistant writes, which the Member has already confirmed."""
+    """Create an Expense.
+
+    Args:
+        amount: The amount spent, a positive number with no currency symbol.
+        date: The expense date as YYYY-MM-DD. Omit for today.
+        category: An existing Category, matched by name or label. An
+            unmatched value is left unset.
+        notes: Free-text note shown on the row.
+        message: Audit text, stored only on external-connector writes and
+            never shown in the app. Omit it for in-app Assistant writes,
+            which the Member has already confirmed.
+    """
     return await current_frappe_client().call(
         f"{_API}.create_expense",
         write=True,
@@ -109,8 +139,17 @@ async def update_expense(
     notes: str | None = None,
     if_modified_since: str | None = None,
 ) -> dict:
-    """Edit an Expense. Pass `if_modified_since` (the row's `modified` value from
-    your last read) so a row changed underneath you is rejected, not clobbered."""
+    """Edit an Expense. Only the fields you pass change.
+
+    Args:
+        name: The row's `name` from `get_expenses`.
+        amount: New amount, a positive number.
+        date: New date as YYYY-MM-DD.
+        category: New Category, matched by name or label.
+        notes: New note.
+        if_modified_since: The row's `modified` value from your last read, so
+            a row changed underneath you is rejected, not clobbered.
+    """
     return await current_frappe_client().call(
         f"{_API}.update_expense",
         write=True,
@@ -124,7 +163,12 @@ async def update_expense(
 
 
 async def delete_expense(name: str, if_modified_since: str | None = None) -> None:
-    """Delete an Expense. Pass `if_modified_since` as for `update_expense`."""
+    """Delete an Expense.
+
+    Args:
+        name: The row's `name` from `get_expenses`.
+        if_modified_since: The row's `modified` value, as for `update_expense`.
+    """
     return await current_frappe_client().call(
         f"{_API}.delete_expense", write=True, name=name, if_modified_since=if_modified_since
     )
@@ -137,9 +181,17 @@ async def create_income(
     notes: str | None = None,
     message: str | None = None,
 ) -> dict:
-    """Create an Income. `source` is matched to an existing Source by name or
-    label; an unmatched value is left unset. `message` is audit-only on
-    external-connector writes (see `create_expense`)."""
+    """Create an Income.
+
+    Args:
+        amount: The amount received, a positive number with no currency symbol.
+        date: The income date as YYYY-MM-DD. Omit for today.
+        source: An existing Source, matched by name or label. An unmatched
+            value is left unset.
+        notes: Free-text note shown on the row.
+        message: Audit text for external-connector writes only, as for
+            `create_expense`.
+    """
     return await current_frappe_client().call(
         f"{_API}.create_income",
         write=True,
@@ -160,7 +212,16 @@ async def update_income(
     notes: str | None = None,
     if_modified_since: str | None = None,
 ) -> dict:
-    """Edit an Income. Pass `if_modified_since` as for `update_expense`."""
+    """Edit an Income. Only the fields you pass change.
+
+    Args:
+        name: The row's `name` from `get_income`.
+        amount: New amount, a positive number.
+        date: New date as YYYY-MM-DD.
+        source: New Source, matched by name or label.
+        notes: New note.
+        if_modified_since: The row's `modified` value, as for `update_expense`.
+    """
     return await current_frappe_client().call(
         f"{_API}.update_income",
         write=True,
@@ -174,26 +235,46 @@ async def update_income(
 
 
 async def delete_income(name: str, if_modified_since: str | None = None) -> None:
-    """Delete an Income. Pass `if_modified_since` as for `update_expense`."""
+    """Delete an Income.
+
+    Args:
+        name: The row's `name` from `get_income`.
+        if_modified_since: The row's `modified` value, as for `update_expense`.
+    """
     return await current_frappe_client().call(
         f"{_API}.delete_income", write=True, name=name, if_modified_since=if_modified_since
     )
 
 
 async def add_category(name: str) -> dict:
-    """Create a new Category in the Family."""
+    """Create a new Category in the Family.
+
+    Args:
+        name: The new Category's name.
+    """
     return await current_frappe_client().call(f"{_API}.add_category", write=True, name=name)
 
 
 async def add_source(name: str) -> dict:
-    """Create a new Source in the Family."""
+    """Create a new Source in the Family.
+
+    Args:
+        name: The new Source's name.
+    """
     return await current_frappe_client().call(f"{_API}.add_source", write=True, name=name)
 
 
 async def set_budget(
     category: str, month: int, year: int, amount: float | None = None
 ) -> dict | None:
-    """Set (or, with amount omitted, clear) a Category's Budget for a month."""
+    """Set a Category's Budget for a month, or clear it.
+
+    Args:
+        category: An existing Category, matched by name or label.
+        month: Calendar month, 1-12.
+        year: Four-digit year.
+        amount: The Budget amount. Omit to clear the Budget.
+    """
     return await current_frappe_client().call(
         f"{_API}.set_budget",
         write=True,

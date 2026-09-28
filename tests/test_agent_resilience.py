@@ -7,6 +7,8 @@ to `OPENAI_FALLBACK_MODEL`'s model when one is set.
 
 from __future__ import annotations
 
+import json
+
 import httpx
 import pytest
 import respx
@@ -14,6 +16,7 @@ from langchain_core.language_models import BaseChatModel
 from langgraph.checkpoint.memory import InMemorySaver
 
 from expenso_assistant.agent.graph import build_graph
+from expenso_assistant.frappe_client import FrappeError
 
 from .conftest import API, method_url
 from .fakes import ScriptedChatModel
@@ -83,6 +86,38 @@ async def test_a_failing_write_is_never_retried(member):
     assert create.call_count == 1
     assert events[-1][0] == "done"  # the error went back to the model, not the turn
     assert "could not be applied" in model.last_prompt[-1].content
+
+
+@respx.mock
+async def test_the_model_sees_the_frappe_message_but_never_the_traceback(member):
+    """A Frappe v1 error body as a system user with tracebacks allowed gets it."""
+    body = {
+        "exc_type": "ValidationError",
+        "exception": "frappe.exceptions.ValidationError: Amount must be positive",
+        "exc": json.dumps(['Traceback (most recent call last):\n  File "/srv/api.py"']),
+        "_server_messages": json.dumps(
+            [json.dumps({"message": "Amount must be <b>positive</b>", "indicator": "red"})]
+        ),
+    }
+    respx.post(method_url(f"{API}.create_expense")).mock(
+        return_value=httpx.Response(417, json=body)
+    )
+    model = ScriptedChatModel(
+        responses=[multi_call(("create_expense", {"amount": -2})), answer("It was rejected.")]
+    )
+    graph = build_graph(model, checkpointer=InMemorySaver())
+    await run_turn(graph, member, "add -2")
+
+    await _resume(graph, member, {"decisions": [approve()]})
+
+    seen = model.last_prompt[-1].content
+    assert seen == "create_expense could not be applied: Amount must be positive"
+
+
+def test_a_non_json_frappe_error_reads_as_its_status():
+    error = FrappeError(502, "<html><body>Bad Gateway</body></html>")
+
+    assert (error.exc_type, error.user_message) == (None, "HTTP 502")
 
 
 async def test_a_failing_model_falls_back(member):
